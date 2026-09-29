@@ -1,8 +1,10 @@
 "use client";
 
+import { usePathname } from "next/navigation";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpIcon, MicrophoneIcon } from "./icons";
-import { MemoryDialog } from "./memory-dialog";
+import { warmGraphState } from "./memory-graph-store";
+import { MemoryTab } from "./memory-tab";
 import { Brand, CharacterHeading, Eyebrow, MemoryButton } from "./primitives";
 
 type ExperienceMode = "intro" | "conversation";
@@ -21,7 +23,7 @@ const initialHistory: ChatMessage[] = [
 
 export function EmoriExperience() {
   const [mode, setMode] = useState<ExperienceMode>("intro");
-  const [dialogOpen, setDialogOpen] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [message, setMessage] = useState("");
   const [latestMessage, setLatestMessage] = useState("hi");
@@ -32,7 +34,9 @@ export function EmoriExperience() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const closeDialog = useCallback(() => setDialogOpen(false), []);
+  const closeMemory = useCallback(() => setMemoryOpen(false), []);
+  // Expanding the memory tab opens /memory over this page (see app/@panel), so it stays mounted.
+  const memoryExpanded = usePathname() === "/memory";
   const listening = voiceState === "recording";
   const voiceBusy = voiceState === "requesting" || voiceState === "transcribing";
 
@@ -288,7 +292,13 @@ export function EmoriExperience() {
     <main className={`experience experience--${mode}`}>
       <header className="site-header">
         <Brand />
-        <MemoryButton onClick={() => setDialogOpen(true)} />
+        <MemoryButton
+          open={memoryOpen}
+          onClick={() => setMemoryOpen((current) => !current)}
+          // Start loading the graph as the pointer or focus arrives, so the tab is often full when it opens.
+          onPointerEnter={warmGraphState}
+          onFocus={warmGraphState}
+        />
       </header>
 
       {mode === "intro" ? (
@@ -373,7 +383,7 @@ export function EmoriExperience() {
         </section>
       )}
 
-      <MemoryDialog open={dialogOpen} onClose={closeDialog} />
+      <MemoryTab open={memoryOpen} expanded={memoryExpanded} onClose={closeMemory} />
     </main>
   );
 }

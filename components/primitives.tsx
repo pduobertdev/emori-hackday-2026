@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import type { ComponentPropsWithRef, ReactNode } from "react";
 import { ClockIcon } from "./icons";
 
 export function Brand() {
@@ -12,11 +12,21 @@ export function Brand() {
   );
 }
 
-type MemoryButtonProps = ButtonHTMLAttributes<HTMLButtonElement>;
+type MemoryButtonProps = ComponentPropsWithRef<"button"> & {
+  /** Whether the memory tab this button controls is open. */
+  open?: boolean;
+};
 
-export function MemoryButton({ className = "", ...props }: MemoryButtonProps) {
+/** The tab handle in the header: a toggle for the memory tab, which hangs from it. */
+export function MemoryButton({ className = "", open = false, ...props }: MemoryButtonProps) {
   return (
-    <button className={`memory-button ${className}`} type="button" {...props}>
+    <button
+      className={`memory-button${open ? " memory-button--open" : ""} ${className}`}
+      type="button"
+      aria-expanded={open}
+      aria-controls="memory-tab"
+      {...props}
+    >
       <ClockIcon />
       <span>How Emori remembers</span>
     </button>

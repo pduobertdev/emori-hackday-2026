@@ -9,7 +9,7 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). The prototype includes push-to-talk transcription, a text conversation view, and the “How Emori remembers” explainer dialog.
+Open [http://localhost:3000](http://localhost:3000). The prototype includes push-to-talk transcription, a text conversation view, and the “How Emori remembers” memory tab.
 
 ## Agent runtime
 
@@ -41,6 +41,8 @@ The prototype limits each recording to 60 seconds and 20 MB. Text-to-speech is n
 ## Memory graph (Neo4j)
 
 New text memories require Neo4j AuraDB and never fall back to a local file. They are stored word for word as immutable nodes, indexed by the people, places, objects and feelings they mention, and recalled per message. Open [http://localhost:3000/memory](http://localhost:3000/memory) to see the graph.
+
+**The memory tab.** The “How Emori remembers” button in the header opens a docked tab beside the conversation (a bottom sheet on phones). It shows a live preview of the graph, the three rules for what Emori keeps, the most recent memories, and a quick way to add one. Expanding it opens the full `/memory` page over the conversation, so an in-progress chat or recording is not lost, and Back collapses it. This is a parallel route with an intercepting route (`app/@panel/(.)memory`); a refresh or a shared `/memory` link gets the standalone page. Adding a new `@slot` folder needs a dev-server restart.
 
 **Local database**
 

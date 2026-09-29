@@ -35,3 +35,27 @@ export function CloseIcon(props: IconProps) {
     </svg>
   );
 }
+
+export function ExpandIcon(props: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" {...props}>
+      <path d="M14 4h6v6M20 4l-7 7M10 20H4v-6M4 20l7-7" />
+    </svg>
+  );
+}
+
+export function CollapseIcon(props: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" {...props}>
+      <path d="M20 10h-6V4M14 10l7-7M4 14h6v6M10 14l-7 7" />
+    </svg>
+  );
+}
+
+export function ArrowRightIcon(props: IconProps) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" {...props}>
+      <path d="m13 6 6 6-6 6M5 12h14" />
+    </svg>
+  );
+}
