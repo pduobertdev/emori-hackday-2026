@@ -29,7 +29,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -38,7 +39,8 @@ button {
 }
 
 button:focus-visible,
-input:focus-visible {
+input:focus-visible,
+textarea:focus-visible {
   outline: 2px solid var(--gold);
   outline-offset: 4px;
 }
@@ -509,7 +511,9 @@ input:focus-visible {
 .memory-dialog {
   position: relative;
   width: min(650px, 100%);
+  max-height: calc(100svh - 84px);
   padding: 48px 37px 36px;
+  overflow-y: auto;
   border: 1px solid #3d3e40;
   border-radius: 34px;
   background: #101720;
@@ -558,6 +562,71 @@ input:focus-visible {
   stroke: currentColor;
   stroke-linecap: round;
   stroke-width: 1.5;
+}
+
+.memory-sample {
+  margin-bottom: 32px;
+  padding: 22px;
+  border: 1px solid #34363a;
+  border-radius: 20px;
+  background: rgba(5, 9, 14, 0.35);
+}
+
+.memory-sample h3 {
+  margin: 0 0 17px;
+  color: var(--gold);
+  font-size: 13px;
+  letter-spacing: 0.2em;
+}
+
+.memory-sample form {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.memory-sample label {
+  grid-column: 1 / -1;
+  color: #b8ad99;
+  font-size: 14px;
+}
+
+.memory-sample textarea,
+.memory-sample input {
+  min-width: 0;
+  padding: 11px 13px;
+  border: 1px solid #414349;
+  border-radius: 12px;
+  color: var(--ivory);
+  background: #090e15;
+}
+
+.memory-sample textarea {
+  grid-column: 1 / -1;
+  resize: vertical;
+}
+
+.memory-sample button {
+  min-height: 43px;
+  padding: 0 17px;
+  border: 1px solid #9b7134;
+  border-radius: 999px;
+  color: var(--ink);
+  background: var(--gold);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.memory-sample button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.memory-sample__status {
+  margin: 14px 0 0;
+  color: #c7a77a;
+  font-size: 13px;
 }
 
 .memory-timeline {

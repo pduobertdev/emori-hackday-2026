@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { CloseIcon } from "./icons";
 
 type MemoryDialogProps = {
@@ -31,6 +31,10 @@ const memoryItems = [
 
 export function MemoryDialog({ open, onClose }: MemoryDialogProps) {
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const [memoryText, setMemoryText] = useState("");
+  const [status, setStatus] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -48,6 +52,68 @@ export function MemoryDialog({ open, onClose }: MemoryDialogProps) {
     };
   }, [open, onClose]);
 
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+
+    void fetch("/api/memory", { cache: "no-store" })
+      .then(async (response) => {
+        const result = (await response.json()) as { text?: string; error?: string };
+        if (!response.ok) throw new Error(result.error || "Could not load memory.");
+        if (!cancelled) setMemoryText(result.text || "");
+      })
+      .catch((error) => {
+        if (!cancelled) setStatus(error instanceof Error ? error.message : "Could not load memory.");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  const saveText = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setIsSaving(true);
+    setStatus("");
+
+    try {
+      const response = await fetch("/api/memory", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: memoryText }),
+      });
+      const result = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(result.error || "Could not save memory.");
+      setStatus("Text saved for future conversations.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not save memory.");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const uploadImage = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const image = imageInputRef.current?.files?.[0];
+    if (!image) return;
+
+    setIsSaving(true);
+    setStatus("");
+
+    try {
+      const body = new FormData();
+      body.set("image", image);
+      const response = await fetch("/api/memory/image", { method: "POST", body });
+      const result = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(result.error || "Could not upload image.");
+      setStatus("Image saved for future conversations.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not upload image.");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   if (!open) return null;
 
   return (
@@ -64,6 +130,37 @@ export function MemoryDialog({ open, onClose }: MemoryDialogProps) {
         </button>
         <h2 id="memory-dialog-title">How Emori remembers</h2>
         <p className="dialog-subtitle">What happens behind every answer.</p>
+
+        <section className="memory-sample" aria-labelledby="memory-sample-title">
+          <h3 id="memory-sample-title">DURABLE SAMPLE</h3>
+          <form onSubmit={saveText}>
+            <label htmlFor="memory-sample-text">Reference text</label>
+            <textarea
+              id="memory-sample-text"
+              value={memoryText}
+              onChange={(event) => setMemoryText(event.target.value)}
+              placeholder="Paste something Mateo should remember across sessions…"
+              rows={4}
+              disabled={isSaving}
+            />
+            <button type="submit" disabled={isSaving || !memoryText.trim()}>Save text</button>
+          </form>
+
+          <form onSubmit={uploadImage}>
+            <label htmlFor="memory-sample-image">Reference JPEG</label>
+            <input
+              ref={imageInputRef}
+              id="memory-sample-image"
+              name="image"
+              type="file"
+              accept="image/jpeg"
+              disabled={isSaving}
+              required
+            />
+            <button type="submit" disabled={isSaving}>Upload image</button>
+          </form>
+          {status ? <p className="memory-sample__status" role="status">{status}</p> : null}
+        </section>
 
         <div className="memory-timeline">
           {memoryItems.map((item) => (

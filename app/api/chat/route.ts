@@ -1,6 +1,7 @@
 import type { ModelMessage } from "ai";
 import { inspectAgentRuntime } from "@/lib/agent/config";
 import { createMateoAgent } from "@/lib/agent/mateo";
+import { readDurableImage, readDurableMemory } from "@/lib/memory/store";
 
 export const maxDuration = 60;
 
@@ -78,11 +79,35 @@ export async function POST(request: Request) {
     );
   }
 
-  const agent = createMateoAgent(runtime.config);
+  const durableMemory = await readDurableMemory();
+  const durableImage = await readDurableImage();
+  const agent = createMateoAgent(runtime.config, durableMemory);
+  const conversation = messages.map(
+    ({ role, content }): ModelMessage => ({ role, content: content.trim() }),
+  );
+  const contextMessages: ModelMessage[] = [];
+
+  if (durableImage) {
+    contextMessages.push({
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: "This is a user-provided durable reference image. Use it when relevant.",
+        },
+        {
+          type: "file",
+          data: durableImage,
+          mediaType: "image/jpeg",
+          filename: "memorysample-image.jpg",
+        },
+      ],
+    });
+  }
+
+  const modelMessages: ModelMessage[] = [...contextMessages, ...conversation];
   const result = await agent.stream({
-    messages: messages.map(
-      ({ role, content }): ModelMessage => ({ role, content: content.trim() }),
-    ),
+    messages: modelMessages,
     abortSignal: request.signal,
   });
 
