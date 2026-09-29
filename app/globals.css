@@ -216,7 +216,7 @@ textarea:focus-visible {
   transition: transform 180ms ease, box-shadow 180ms ease;
 }
 
-.voice-orb:hover {
+.voice-orb:hover:not(:disabled) {
   transform: scale(1.025);
   box-shadow:
     0 0 0 2px rgba(199, 128, 38, 0.92) inset,
@@ -226,6 +226,15 @@ textarea:focus-visible {
 
 .voice-orb--listening {
   animation: listening-pulse 1.8s ease-in-out infinite;
+}
+
+.voice-orb--processing {
+  cursor: wait;
+  animation: processing-pulse 1.25s ease-in-out infinite alternate;
+}
+
+.voice-orb:disabled {
+  cursor: wait;
 }
 
 .voice-orb svg {
@@ -765,6 +774,11 @@ textarea:focus-visible {
 @keyframes thinking {
   from { opacity: 0.38; transform: translateY(1px); }
   to { opacity: 1; transform: translateY(-1px); }
+}
+
+@keyframes processing-pulse {
+  from { opacity: 0.62; }
+  to { opacity: 1; }
 }
 
 @media (max-width: 760px) {

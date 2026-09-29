@@ -9,7 +9,7 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). The prototype includes the voice landing state, a text conversation view, and the “How Emori remembers” explainer dialog.
+Open [http://localhost:3000](http://localhost:3000). The prototype includes push-to-talk transcription, a text conversation view, and the “How Emori remembers” explainer dialog.
 
 ## Agent runtime
 
@@ -31,3 +31,9 @@ npm run agent -- "Hello, Mateo."
 ```
 
 See [the runtime research report](docs/agent-runtime-report.md) for the provider and open-source framework evaluation.
+
+## Voice transcription
+
+Add `ELEVENLABS_API_KEY` to `.env.local` to enable the microphone. Tap once to start recording and again to stop. The recording is sent through the server-only `/api/voice/transcribe` route to ElevenLabs Scribe v2, then the transcript is placed in the composer for review before sending.
+
+The prototype limits each recording to 60 seconds and 20 MB. Text-to-speech is not included yet.
