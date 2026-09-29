@@ -1,6 +1,9 @@
 import type { ModelMessage } from "ai";
 import { inspectAgentRuntime } from "@/lib/agent/config";
 import { createMateoAgent } from "@/lib/agent/mateo";
+import { inspectMemoryGraph } from "@/lib/memory/graph/config";
+import { formatMemoriesForPrompt, recallQueryFromMessages } from "@/lib/memory/graph/recall";
+import { recallMemories } from "@/lib/memory/graph/repository";
 import { readDurableImage, readDurableMemory } from "@/lib/memory/store";
 
 export const maxDuration = 60;
@@ -22,6 +25,29 @@ function isIncomingMessage(value: unknown): value is IncomingMessage {
     candidate.content.trim().length > 0 &&
     candidate.content.length <= MAX_MESSAGE_LENGTH
   );
+}
+
+type MemoryStore = "graph" | "file" | "file-fallback";
+
+/**
+ * Recall what is relevant to this conversation from the memory graph. If the graph is not
+ * configured, use the flat file. If it is configured but fails, degrade to the flat file
+ * rather than break the conversation.
+ */
+async function loadDurableMemory(
+  messages: IncomingMessage[],
+): Promise<{ text: string; store: MemoryStore }> {
+  if (!inspectMemoryGraph().configured) {
+    return { text: await readDurableMemory(), store: "file" };
+  }
+
+  try {
+    const recalled = await recallMemories(recallQueryFromMessages(messages));
+    return { text: formatMemoriesForPrompt(recalled), store: "graph" };
+  } catch (error) {
+    console.error("Memory recall failed; falling back to the flat file:", error);
+    return { text: await readDurableMemory(), store: "file-fallback" };
+  }
 }
 
 export async function GET() {
@@ -79,9 +105,9 @@ export async function POST(request: Request) {
     );
   }
 
-  const durableMemory = await readDurableMemory();
+  const durableMemory = await loadDurableMemory(messages);
   const durableImage = await readDurableImage();
-  const agent = createMateoAgent(runtime.config, durableMemory);
+  const agent = createMateoAgent(runtime.config, durableMemory.text);
   const conversation = messages.map(
     ({ role, content }): ModelMessage => ({ role, content: content.trim() }),
   );
@@ -115,6 +141,7 @@ export async function POST(request: Request) {
     headers: {
       "Cache-Control": "no-store",
       "X-Emori-Provider": runtime.provider,
+      "X-Emori-Memory": durableMemory.store,
     },
   });
 }
