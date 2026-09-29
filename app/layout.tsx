@@ -6,10 +6,16 @@ export const metadata: Metadata = {
   description: "A voice-first AI memory experience.",
 };
 
-export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+export default function RootLayout({
+  children,
+  panel,
+}: Readonly<{ children: React.ReactNode; panel: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        {children}
+        {panel}
+      </body>
     </html>
   );
 }

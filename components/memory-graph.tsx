@@ -21,7 +21,9 @@ import {
   type SimulationLinkDatum,
   type SimulationNodeDatum,
 } from "d3-force";
+import { CollapseIcon } from "./icons";
 import { AddPanel, AskPanel } from "./memory-agent-panels";
+import { type LoadState, loadGraphState, peekGraphState, sameGraphState } from "./memory-graph-store";
 import { Brand, Eyebrow } from "./primitives";
 import type { AskResult } from "../lib/memory/graph/ask";
 import type {
@@ -31,16 +33,9 @@ import type {
   GraphLink,
   GraphMemoryNode,
   GraphNode,
-  MemoryGraphConnection,
   MemoryGraphData,
 } from "../lib/memory/graph/types";
 import { buildAdjacency, connectingEntityIds, shortestPath, sharedEntityIds } from "../lib/memory/graph/view";
-
-type LoadState =
-  | { status: "loading" }
-  | { status: "unconfigured"; missing: string[] }
-  | { status: "error"; message: string }
-  | { status: "ready"; data: MemoryGraphData; connection: MemoryGraphConnection; agent: AgentStatus };
 
 type PanelTab = "explore" | "add" | "ask";
 type Highlight = {
@@ -104,36 +99,6 @@ function nodeName(node: GraphNode) {
   return isEntity(node) ? node.name : `${node.source === "mateo_story" ? "✣ " : ""}${snippet(node.text, 34)}`;
 }
 
-async function fetchGraphState(): Promise<LoadState> {
-  try {
-    const response = await fetch("/api/memory/graph", { cache: "no-store" });
-    const body = (await response.json().catch(() => null)) as
-      | (Partial<MemoryGraphData> & {
-          configured?: boolean;
-          connection?: MemoryGraphConnection;
-          missing?: string[];
-          agent?: AgentStatus;
-          error?: string;
-        })
-      | null;
-
-    if (!response.ok) throw new Error(body?.error || "The memory graph could not be loaded.");
-    if (!body || body.configured === false) return { status: "unconfigured", missing: body?.missing ?? [] };
-
-    return {
-      status: "ready",
-      data: body as MemoryGraphData,
-      connection: body.connection ?? { kind: "remote", label: "Remote Neo4j" },
-      agent: body.agent ?? { configured: false },
-    };
-  } catch (error) {
-    return {
-      status: "error",
-      message: error instanceof Error ? error.message : "The memory graph could not be loaded.",
-    };
-  }
-}
-
 function formatDate(iso: string) {
   const date = new Date(iso);
   return Number.isNaN(date.getTime())
@@ -141,8 +106,20 @@ function formatDate(iso: string) {
     : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
 }
 
-export function MemoryGraphView() {
-  const [state, setState] = useState<LoadState>({ status: "loading" });
+type MemoryGraphViewProps = {
+  /**
+   * "page" is the standalone /memory route. "overlay" is the same view opened from the memory tab,
+   * over the conversation, and swaps the way back to Mateo for a way back to the tab.
+   */
+  variant?: "page" | "overlay";
+  onCollapse?: () => void;
+};
+
+const isPanelTab = (value: string | null): value is PanelTab => TABS.some((item) => item.id === value);
+
+export function MemoryGraphView({ variant = "page", onCollapse }: MemoryGraphViewProps) {
+  // Opened from the memory tab, the graph is usually already loaded: show it now, refresh behind it.
+  const [state, setState] = useState<LoadState>(() => peekGraphState() ?? { status: "loading" });
   const [positions, setPositions] = useState<Map<string, Point>>(new Map());
   const [view, setView] = useState<View>({ x: 0, y: 0, k: 1 });
   const [size, setSize] = useState({ w: 800, h: 600 });
@@ -186,7 +163,10 @@ export function MemoryGraphView() {
     setView({ k, x: (-(minX + maxX) / 2) * k, y: (-(minY + maxY) / 2) * k });
   }, []);
 
-  const refresh = useCallback(async () => setState(await fetchGraphState()), []);
+  const refresh = useCallback(async () => {
+    const next = await loadGraphState({ force: true });
+    setState((current) => (sameGraphState(current, next) ? current : next));
+  }, []);
 
   // When a reload brings new nodes, remember which so they can ripple in. This is derived from
   // the previous render's data, so it needs no ref (see React's "storing previous renders").
@@ -204,8 +184,29 @@ export function MemoryGraphView() {
   useEffect(() => {
     let cancelled = false;
 
-    void fetchGraphState().then((next) => {
-      if (!cancelled) setState(next);
+    // Links from the memory tab can name a memory to open, or a tool to start on.
+    const applyDeepLink = (next: LoadState) => {
+      if (cancelled || next.status !== "ready") return;
+
+      const params = new URLSearchParams(window.location.search);
+      const focus = params.get("focus");
+      const wanted = params.get("tab");
+
+      if (focus && next.data.nodes.some((node) => node.id === focus)) {
+        setSelectedId(focus);
+        setTab("explore");
+      } else if (isPanelTab(wanted)) {
+        setTab(wanted);
+      }
+    };
+
+    const cached = peekGraphState();
+    if (cached) queueMicrotask(() => applyDeepLink(cached));
+
+    void loadGraphState().then((next) => {
+      if (cancelled) return;
+      setState((current) => (sameGraphState(current, next) ? current : next));
+      if (!cached) applyDeepLink(next);
     });
 
     return () => {
@@ -754,7 +755,7 @@ export function MemoryGraphView() {
   };
 
   return (
-    <div className="experience graph-page">
+    <div className={`experience graph-page${variant === "overlay" ? " graph-page--overlay" : ""}`}>
       <header className="graph-header">
         <Brand />
         {state.status === "ready" ? (
@@ -764,9 +765,16 @@ export function MemoryGraphView() {
             {state.connection.instance ? ` · ${state.connection.instance}…` : ""}
           </p>
         ) : null}
-        <Link className="graph-back" href="/">
-          ← Back to Mateo
-        </Link>
+        {variant === "overlay" ? (
+          <button className="graph-back graph-back--button" type="button" onClick={onCollapse}>
+            <CollapseIcon />
+            Collapse to tab
+          </button>
+        ) : (
+          <Link className="graph-back" href="/">
+            ← Back to Mateo
+          </Link>
+        )}
       </header>
 
       <main className="graph-layout">
