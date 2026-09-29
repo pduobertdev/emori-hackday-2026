@@ -1,4 +1,4 @@
-import { inspectMemoryGraph } from "@/lib/memory/graph/config";
+import { inspectMemoryGraph, isAuraMemoryGraph } from "@/lib/memory/graph/config";
 import { NO_STORE, memoryGraphErrorResponse } from "@/lib/memory/graph/http";
 import { saveUserMemory } from "@/lib/memory/graph/service";
 
@@ -7,8 +7,9 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 export async function POST(request: Request) {
-  if (!inspectMemoryGraph().configured) {
-    return Response.json({ error: "The memory graph is not configured." }, { status: 503 });
+  const graph = inspectMemoryGraph();
+  if (!graph.configured || !isAuraMemoryGraph(graph.config)) {
+    return Response.json({ error: "Neo4j AuraDB is not configured." }, { status: 503 });
   }
 
   let payload: unknown;

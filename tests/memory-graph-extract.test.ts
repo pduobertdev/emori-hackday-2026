@@ -16,7 +16,11 @@ import {
   formatMemoriesForPrompt,
   recallQueryFromMessages,
 } from "../lib/memory/graph/recall";
-import { inspectMemoryGraph } from "../lib/memory/graph/config";
+import {
+  describeMemoryGraphConnection,
+  inspectMemoryGraph,
+  isAuraMemoryGraph,
+} from "../lib/memory/graph/config";
 import { sourceForOwner, type RecalledMemory } from "../lib/memory/graph/types";
 
 const TEXT = "In March 2023 we visited Marisol in Lisbon and ate custard tarts. I felt so happy.";
@@ -170,6 +174,23 @@ test("the memory graph is configured only when a URI and password are present", 
   const status = inspectMemoryGraph({ NEO4J_URI: "bolt://x", NEO4J_PASSWORD: "p" });
   assert.ok(status.configured);
   assert.equal(status.configured && status.config.username, "neo4j");
+});
+
+test("Aura connections are distinguished from local Neo4j", () => {
+  const aura = { uri: "neo4j+s://7e996fba.databases.neo4j.io", username: "user", password: "p" };
+  const local = { uri: "bolt://localhost:7687", username: "neo4j", password: "p" };
+
+  assert.equal(isAuraMemoryGraph(aura), true);
+  assert.equal(isAuraMemoryGraph(local), false);
+  assert.deepEqual(describeMemoryGraphConnection(aura.uri), {
+    kind: "aura",
+    label: "Neo4j AuraDB",
+    instance: "7e996fba",
+  });
+  assert.deepEqual(describeMemoryGraphConnection(local.uri), {
+    kind: "local",
+    label: "Local Neo4j",
+  });
 });
 
 // --- model extraction against a mock OpenAI-compatible server -------------------------------

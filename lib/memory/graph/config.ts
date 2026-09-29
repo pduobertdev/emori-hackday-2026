@@ -30,6 +30,10 @@ export function describeMemoryGraphConnection(uri: string): MemoryGraphConnectio
   return { kind: "remote", label: "Remote Neo4j" };
 }
 
+export function isAuraMemoryGraph(config: MemoryGraphConfig): boolean {
+  return describeMemoryGraphConnection(config.uri).kind === "aura";
+}
+
 export type MemoryGraphStatus =
   | { configured: true; config: MemoryGraphConfig }
   | { configured: false; missing: string[] };

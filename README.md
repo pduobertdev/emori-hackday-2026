@@ -40,7 +40,7 @@ The prototype limits each recording to 60 seconds and 20 MB. Text-to-speech is n
 
 ## Memory graph (Neo4j)
 
-Optional. Without it, Emori keeps using the flat `memorysample.txt` file. With it, memories are stored word for word as immutable nodes, indexed by the people, places, objects and feelings they mention, and recalled per message instead of pasted in whole. Open [http://localhost:3000/memory](http://localhost:3000/memory) to see the graph.
+New text memories require Neo4j AuraDB and never fall back to a local file. They are stored word for word as immutable nodes, indexed by the people, places, objects and feelings they mention, and recalled per message. Open [http://localhost:3000/memory](http://localhost:3000/memory) to see the graph.
 
 **Local database**
 
