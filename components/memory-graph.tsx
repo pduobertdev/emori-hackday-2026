@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import {
-  FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
   useCallback,
@@ -22,8 +21,11 @@ import {
   type SimulationLinkDatum,
   type SimulationNodeDatum,
 } from "d3-force";
+import { AddPanel, AskPanel } from "./memory-agent-panels";
 import { Brand, Eyebrow } from "./primitives";
+import type { AskResult } from "../lib/memory/graph/ask";
 import type {
+  AgentStatus,
   EntityKind,
   GraphEntityNode,
   GraphLink,
@@ -32,12 +34,21 @@ import type {
   MemoryGraphConnection,
   MemoryGraphData,
 } from "../lib/memory/graph/types";
+import { buildAdjacency, connectingEntityIds, shortestPath, sharedEntityIds } from "../lib/memory/graph/view";
 
 type LoadState =
   | { status: "loading" }
   | { status: "unconfigured"; missing: string[] }
   | { status: "error"; message: string }
-  | { status: "ready"; data: MemoryGraphData; connection: MemoryGraphConnection };
+  | { status: "ready"; data: MemoryGraphData; connection: MemoryGraphConnection; agent: AgentStatus };
+
+type PanelTab = "explore" | "add" | "ask";
+type Highlight = {
+  ids: Set<string>;
+  label: string;
+  /** Small numbers drawn on nodes: citation numbers for an answer, step numbers for a path. */
+  badges?: Map<string, string>;
+};
 
 type SimNode = SimulationNodeDatum & { id: string; radius: number };
 type SimLink = SimulationLinkDatum<SimNode> & { link: GraphLink };
@@ -57,10 +68,16 @@ const KIND_LABEL: Record<EntityKind, string> = {
   topic: "Topic",
 };
 const KIND_ORDER: EntityKind[] = ["person", "place", "object", "feeling", "event", "topic"];
+const TABS: Array<{ id: PanelTab; label: string }> = [
+  { id: "explore", label: "Explore" },
+  { id: "add", label: "Add" },
+  { id: "ask", label: "Ask" },
+];
 
-const MIN_ZOOM = 0.35;
+const MIN_ZOOM = 0.2;
 const MAX_ZOOM = 3;
 const DRAG_THRESHOLD = 4;
+const FRESH_MS = 4_500;
 
 const isMemory = (node: GraphNode): node is GraphMemoryNode => node.type === "memory";
 const isEntity = (node: GraphNode): node is GraphEntityNode => node.type === "entity";
@@ -77,9 +94,14 @@ function describeExtractor(memory: GraphMemoryNode) {
   if (memory.extraction === "pending") return "These connections have not been found yet.";
   const extractor = memory.extractor ?? "";
   if (extractor === "seed") return "These connections were written by hand for the demo.";
+  if (extractor === "scout") return "These connections were suggested by the memory scout, and you approved the passage.";
   if (extractor === "heuristic") return "These connections came from a simple word-matching pass, not a model.";
   if (extractor.startsWith("llm:")) return `These connections were found by ${extractor.slice(4)}.`;
   return "These connections are derived.";
+}
+
+function nodeName(node: GraphNode) {
+  return isEntity(node) ? node.name : `${node.source === "mateo_story" ? "✣ " : ""}${snippet(node.text, 34)}`;
 }
 
 async function fetchGraphState(): Promise<LoadState> {
@@ -90,6 +112,7 @@ async function fetchGraphState(): Promise<LoadState> {
           configured?: boolean;
           connection?: MemoryGraphConnection;
           missing?: string[];
+          agent?: AgentStatus;
           error?: string;
         })
       | null;
@@ -101,6 +124,7 @@ async function fetchGraphState(): Promise<LoadState> {
       status: "ready",
       data: body as MemoryGraphData,
       connection: body.connection ?? { kind: "remote", label: "Remote Neo4j" },
+      agent: body.agent ?? { configured: false },
     };
   } catch (error) {
     return {
@@ -122,9 +146,13 @@ export function MemoryGraphView() {
   const [positions, setPositions] = useState<Map<string, Point>>(new Map());
   const [view, setView] = useState<View>({ x: 0, y: 0, k: 1 });
   const [size, setSize] = useState({ w: 800, h: 600 });
+  const [tab, setTab] = useState<PanelTab>("explore");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hoverId, setHoverId] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
+  const [highlight, setHighlight] = useState<Highlight | null>(null);
+  const [tracePath, setTracePath] = useState<string[] | null>(null);
+  const [traceTarget, setTraceTarget] = useState("");
+  const [freshIds, setFreshIds] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -139,6 +167,9 @@ export function MemoryGraphView() {
   const sizeRef = useRef(size);
   // Once the user pans or zooms, stop re-fitting the view underneath them.
   const viewTouchedRef = useRef(false);
+
+  const data = state.status === "ready" ? state.data : undefined;
+  const agent: AgentStatus = state.status === "ready" ? state.agent : { configured: false };
 
   const fitToView = useCallback(() => {
     const nodes = simNodesRef.current;
@@ -155,9 +186,20 @@ export function MemoryGraphView() {
     setView({ k, x: (-(minX + maxX) / 2) * k, y: (-(minY + maxY) / 2) * k });
   }, []);
 
-  const data = state.status === "ready" ? state.data : undefined;
+  const refresh = useCallback(async () => setState(await fetchGraphState()), []);
 
-  const load = useCallback(async () => setState(await fetchGraphState()), []);
+  // When a reload brings new nodes, remember which so they can ripple in. This is derived from
+  // the previous render's data, so it needs no ref (see React's "storing previous renders").
+  const [seenData, setSeenData] = useState<MemoryGraphData | undefined>(undefined);
+  if (data && data !== seenData) {
+    setSeenData(data);
+
+    if (seenData) {
+      const before = new Set(seenData.nodes.map((node) => node.id));
+      const added = data.nodes.map((node) => node.id).filter((id) => !before.has(id));
+      if (added.length > 0) setFreshIds(new Set(added));
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -170,6 +212,12 @@ export function MemoryGraphView() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (freshIds.size === 0) return;
+    const timer = setTimeout(() => setFreshIds(new Set()), FRESH_MS);
+    return () => clearTimeout(timer);
+  }, [freshIds]);
 
   useEffect(() => {
     const query = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -216,32 +264,31 @@ export function MemoryGraphView() {
         "link",
         forceLink<SimNode, SimLink>(links)
           .id((node) => node.id)
-          .distance((link) => (link.link.type === "RELATED_TO" ? 70 : 92))
-          .strength(0.5),
+          .distance((link) => (link.link.type === "RELATED_TO" ? 64 : 82))
+          .strength(0.55),
       )
-      .force("charge", forceManyBody<SimNode>().strength((node) => (node.radius > 12 ? -430 : -170)))
-      .force("collide", forceCollide<SimNode>().radius((node) => node.radius + 14))
-      .force("x", forceX<SimNode>(0).strength(0.045))
-      .force("y", forceY<SimNode>(0).strength(0.045))
+      .force("charge", forceManyBody<SimNode>().strength((node) => (node.radius > 12 ? -380 : -150)))
+      .force("collide", forceCollide<SimNode>().radius((node) => node.radius + 13))
+      .force("x", forceX<SimNode>(0).strength(0.1))
+      .force("y", forceY<SimNode>(0).strength(0.1))
       .alphaDecay(0.025)
       .stop();
 
-    simulation.tick(reducedMotion ? 320 : 110);
+    // Settle most of the layout before first paint so the first fit is close to the final one.
+    simulation.tick(reducedMotion ? 320 : 220);
     simNodesRef.current = nodes;
     simRef.current = simulation;
     setPositions(new Map(nodes.map((node) => [node.id, { x: node.x ?? 0, y: node.y ?? 0 }])));
 
-    simulation.on("end", () => {
+    const fitIfUntouched = () => {
       if (!viewTouchedRef.current) fitToView();
-    });
+    };
 
-    if (reducedMotion) {
-      // No animation: the layout is already settled, so fit it now via the same callback path.
-      queueMicrotask(() => {
-        if (!viewTouchedRef.current) fitToView();
-      });
-    } else {
-      simulation.on("tick", publishPositions).alpha(0.3).restart();
+    simulation.on("end", fitIfUntouched);
+    queueMicrotask(fitIfUntouched);
+
+    if (!reducedMotion) {
+      simulation.on("tick", publishPositions).alpha(0.15).restart();
     }
 
     return () => {
@@ -276,21 +323,20 @@ export function MemoryGraphView() {
   }, [size.w, size.h, state.status]);
 
   const nodeById = useMemo(() => new Map((data?.nodes ?? []).map((node) => [node.id, node])), [data]);
+  const adjacency = useMemo(() => buildAdjacency(data?.links ?? []), [data]);
+  const sharedIds = useMemo(() => sharedEntityIds(data?.nodes ?? [], adjacency), [data, adjacency]);
 
-  const adjacency = useMemo(() => {
-    const map = new Map<string, Set<string>>();
-    for (const link of data?.links ?? []) {
-      if (!map.has(link.source)) map.set(link.source, new Set());
-      if (!map.has(link.target)) map.set(link.target, new Set());
-      map.get(link.source)?.add(link.target);
-      map.get(link.target)?.add(link.source);
-    }
-    return map;
-  }, [data]);
-
+  const memories = useMemo(() => (data?.nodes ?? []).filter(isMemory), [data]);
   const selected = selectedId ? nodeById.get(selectedId) : undefined;
-  const focusId = hoverId ?? (selected ? selected.id : null);
-  const neighbors = focusId ? adjacency.get(focusId) : undefined;
+
+  // What the canvas emphasises: hover wins, then an explicit highlight, then the selection.
+  const emphasis = useMemo(() => {
+    const around = (id: string) => new Set([id, ...(adjacency.get(id) ?? [])]);
+    if (hoverId) return { ids: around(hoverId), center: hoverId };
+    if (highlight) return { ids: highlight.ids, center: null };
+    if (selected) return { ids: around(selected.id), center: selected.id };
+    return null;
+  }, [hoverId, highlight, selected, adjacency]);
 
   const toWorld = (clientX: number, clientY: number): Point => {
     const rect = svgRef.current?.getBoundingClientRect();
@@ -300,10 +346,18 @@ export function MemoryGraphView() {
     };
   };
 
-  const select = (id: string | null) => {
+  const clearHighlight = () => {
+    setHighlight(null);
+    setTracePath(null);
+    setTraceTarget("");
+  };
+
+  const select = (id: string | null, options: { keepHighlight?: boolean; openExplore?: boolean } = {}) => {
     setSelectedId(id);
     setConfirmingDelete(false);
     setNotice("");
+    if (!options.keepHighlight) clearHighlight();
+    if (options.openExplore || id === null) setTab("explore");
   };
 
   const onNodePointerDown = (event: ReactPointerEvent<SVGGElement>, id: string) => {
@@ -360,7 +414,7 @@ export function MemoryGraphView() {
       drag.node.fx = null;
       drag.node.fy = null;
       simRef.current?.alphaTarget(0);
-      if (!drag.moved) select(drag.node.id);
+      if (!drag.moved) select(drag.node.id, { openExplore: true });
     } else if (!drag.moved) {
       select(null);
     }
@@ -369,7 +423,7 @@ export function MemoryGraphView() {
   const onNodeKeyDown = (event: ReactKeyboardEvent<SVGGElement>, id: string) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      select(id);
+      select(id, { openExplore: true });
     }
   };
 
@@ -387,40 +441,6 @@ export function MemoryGraphView() {
     });
   };
 
-  const saveMemory = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!draft.trim()) return;
-
-    setBusy(true);
-    setNotice("");
-
-    try {
-      const response = await fetch("/api/memory/entries", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: draft }),
-      });
-      const body = (await response.json().catch(() => null)) as
-        | { memory?: { id: string; extraction: string }; entities?: number; error?: string }
-        | null;
-
-      if (!response.ok || !body?.memory) throw new Error(body?.error || "The memory could not be saved.");
-
-      setDraft("");
-      await load();
-      setSelectedId(body.memory.id);
-      setNotice(
-        body.memory.extraction === "done"
-          ? `Saved word for word. Found ${body.entities ?? 0} connection${body.entities === 1 ? "" : "s"}.`
-          : "Saved word for word. Its connections could not be found yet.",
-      );
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "The memory could not be saved.");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const eraseMemory = async (id: string) => {
     setBusy(true);
     setNotice("");
@@ -432,7 +452,8 @@ export function MemoryGraphView() {
 
       setSelectedId(null);
       setConfirmingDelete(false);
-      await load();
+      clearHighlight();
+      await refresh();
       setNotice("Memory erased, along with any connections only it supported.");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The memory could not be erased.");
@@ -441,22 +462,90 @@ export function MemoryGraphView() {
     }
   };
 
-  const memories = (data?.nodes ?? []).filter(isMemory);
+  const onSaved = async (ids: string[], message: string) => {
+    await refresh();
+    select(ids[0] ?? null, { openExplore: true });
+    setNotice(message);
+  };
+
+  const onAnswer = (result: AskResult) => {
+    setSelectedId(null);
+    setTracePath(null);
+    if (result.cited.length === 0) {
+      setHighlight(null);
+      return;
+    }
+
+    const ids = new Set([...result.cited, ...connectingEntityIds(result.cited, adjacency, data?.nodes ?? [])]);
+    const badges = new Map(result.evidence.filter((item) => result.cited.includes(item.id)).map((item) => [item.id, String(item.n)]));
+    setHighlight({ ids, label: "Evidence for the answer", badges });
+  };
+
+  const showShared = () => {
+    const ids = new Set(sharedIds);
+    for (const id of sharedIds) for (const neighbor of adjacency.get(id) ?? []) ids.add(neighbor);
+    setSelectedId(null);
+    setTracePath(null);
+    setHighlight({ ids, label: "Threads Leo and Mateo share" });
+  };
+
+  const trace = (from: string, to: string) => {
+    setTraceTarget(to);
+    if (!to) {
+      clearHighlight();
+      return;
+    }
+
+    const path = shortestPath(adjacency, from, to);
+    setTracePath(path);
+    setHighlight(
+      path
+        ? {
+            ids: new Set(path),
+            label: "Connection between two nodes",
+            badges: new Map(path.map((id, index) => [id, String(index + 1)])),
+          }
+        : null,
+    );
+    if (!path) setNotice("Those two are not connected yet.");
+  };
+
+  const onTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    const index = TABS.findIndex((item) => item.id === tab);
+    const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+    if (!step) return;
+
+    event.preventDefault();
+    const next = TABS[(index + step + TABS.length) % TABS.length].id;
+    setTab(next);
+    document.getElementById(`graph-tab-${next}`)?.focus();
+  };
+
   const isEmpty = state.status === "ready" && memories.length === 0;
 
-  const linkIsActive = (link: GraphLink) =>
-    focusId !== null && (link.source === focusId || link.target === focusId || link.memoryId === focusId);
+  const linkIsActive = (link: GraphLink) => {
+    if (!emphasis) return false;
+    if (emphasis.center) {
+      return link.source === emphasis.center || link.target === emphasis.center || link.memoryId === emphasis.center;
+    }
+    return emphasis.ids.has(link.source) && emphasis.ids.has(link.target);
+  };
 
-  const nodeIsDim = (id: string) => focusId !== null && id !== focusId && !neighbors?.has(id);
+  const nodeIsDim = (id: string) => emphasis !== null && !emphasis.ids.has(id);
 
   const renderNode = (node: GraphNode) => {
     const point = positions.get(node.id) ?? { x: 0, y: 0 };
     const dim = nodeIsDim(node.id);
     const isSelected = node.id === selectedId;
-    const showLabel = isEntity(node) || node.id === focusId;
+    const radius = radiusFor(node);
+    const showLabel = isEntity(node) || emphasis?.center === node.id;
+    const badge = highlight?.badges?.get(node.id);
     const label = isEntity(node) ? node.name : snippet(node.text, 48);
+    const shared = isEntity(node) && sharedIds.has(node.id);
     const aria = isEntity(node)
-      ? `${KIND_LABEL[node.kind]}: ${node.name}, in ${node.mentions} ${node.mentions === 1 ? "memory" : "memories"}`
+      ? `${KIND_LABEL[node.kind]}: ${node.name}, in ${node.mentions} ${node.mentions === 1 ? "memory" : "memories"}${
+          shared ? ", shared by Leo and Mateo" : ""
+        }`
       : `${sourceLabel(node)}: ${snippet(node.text, 70)}`;
 
     return (
@@ -475,22 +564,30 @@ export function MemoryGraphView() {
         onBlur={() => setHoverId((current) => (current === node.id ? null : current))}
         onKeyDown={(event) => onNodeKeyDown(event, node.id)}
       >
+        {freshIds.has(node.id) ? <circle className="graph-ripple" r={radius} /> : null}
+        {shared ? <circle className="graph-halo" r={radius + 5} /> : null}
         {isEntity(node) ? (
-          <circle className={`graph-dot graph-dot--${node.kind}`} r={radiusFor(node)} />
+          <circle className={`graph-dot graph-dot--${node.kind}`} r={radius} />
         ) : node.source === "mateo_story" ? (
           <>
-            <circle className="graph-story" r={radiusFor(node)} />
+            <circle className="graph-story" r={radius} />
             <text className="graph-glyph" textAnchor="middle" dominantBaseline="central" aria-hidden="true">
               ✣
             </text>
           </>
         ) : (
-          <circle className="graph-ring" r={radiusFor(node)} />
+          <circle className="graph-ring" r={radius} />
         )}
+        {badge ? (
+          <g className="graph-badge" transform={`translate(${radius * 0.8} ${-radius * 0.8})`} aria-hidden="true">
+            <circle r="8" />
+            <text textAnchor="middle" dominantBaseline="central">{badge}</text>
+          </g>
+        ) : null}
         {showLabel ? (
           <text
             className={`graph-label${isMemory(node) ? " graph-label--memory" : ""}`}
-            y={radiusFor(node) + 15}
+            y={radius + (shared ? 20 : 15)}
             textAnchor="middle"
             aria-hidden="true"
           >
@@ -508,6 +605,153 @@ export function MemoryGraphView() {
     (data?.links ?? []).filter(
       (link) => link.type === "RELATED_TO" && (link.source === entity.id || link.target === entity.id),
     );
+
+  const sharedEntities = [...sharedIds]
+    .map((id) => nodeById.get(id))
+    .filter((node): node is GraphEntityNode => !!node && isEntity(node))
+    .sort((a, b) => b.mentions - a.mentions);
+
+  const traceOptions = (data?.nodes ?? []).filter((node) => node.id !== selected?.id);
+
+  const memoryListItem = (memory: GraphMemoryNode) => (
+    <li key={memory.id}>
+      <button type="button" onClick={() => select(memory.id, { openExplore: true })}>
+        <span className="graph-list__source">{memory.source === "mateo_story" ? "✣ Mateo’s story" : "Leo"}</span>
+        {snippet(memory.text, 110)}
+      </button>
+    </li>
+  );
+
+  const exploreDetail = () => {
+    if (selected && isMemory(selected)) {
+      return (
+        <section className="graph-detail" aria-label="Selected memory">
+          <p className={`graph-chip${selected.source === "mateo_story" ? " graph-chip--story" : ""}`}>
+            {selected.source === "mateo_story" ? "✣ " : ""}
+            {sourceLabel(selected)}
+          </p>
+          <blockquote>{selected.text}</blockquote>
+          <p className="graph-meta">
+            Saved {formatDate(selected.createdAt)}
+            {selected.eventDate ? ` · about ${selected.eventDate}` : ""}
+          </p>
+
+          <h2>Connected through</h2>
+          {(() => {
+            const entities = [...(adjacency.get(selected.id) ?? [])]
+              .map((id) => nodeById.get(id))
+              .filter((node): node is GraphEntityNode => !!node && isEntity(node));
+
+            return entities.length ? (
+              <ul className="graph-chips">
+                {entities.map((entity) => (
+                  <li key={entity.id}>
+                    <button type="button" onClick={() => select(entity.id, { openExplore: true })}>
+                      <i className={`graph-swatch graph-swatch--${entity.kind}`} aria-hidden="true" />
+                      {entity.name}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="graph-note">Nothing found yet.</p>
+            );
+          })()}
+          <p className="graph-note">{describeExtractor(selected)}</p>
+
+          {selected.source === "user" ? (
+            confirmingDelete ? (
+              <div className="graph-confirm" role="group" aria-label="Confirm erase">
+                <p>Erase this memory permanently?</p>
+                <button className="graph-button graph-button--danger" type="button" disabled={busy} onClick={() => void eraseMemory(selected.id)}>
+                  Yes, erase it
+                </button>
+                <button className="graph-button graph-button--quiet" type="button" onClick={() => setConfirmingDelete(false)}>
+                  Keep it
+                </button>
+              </div>
+            ) : (
+              <button className="graph-button graph-button--quiet" type="button" onClick={() => setConfirmingDelete(true)}>
+                Erase memory
+              </button>
+            )
+          ) : null}
+        </section>
+      );
+    }
+
+    if (selected && isEntity(selected)) {
+      const relations = relationsOf(selected);
+
+      return (
+        <section className="graph-detail" aria-label="Selected connection">
+          <p className="graph-chip">
+            <i className={`graph-swatch graph-swatch--${selected.kind}`} aria-hidden="true" />
+            {KIND_LABEL[selected.kind]} · derived
+            {sharedIds.has(selected.id) ? " · shared" : ""}
+          </p>
+          <h2 className="graph-entity-name">{selected.name}</h2>
+          <p className="graph-meta">
+            In {selected.mentions} {selected.mentions === 1 ? "memory" : "memories"}
+            {sharedIds.has(selected.id) ? ", from both Leo and Mateo" : ""}
+          </p>
+
+          {relations.length ? (
+            <ul className="graph-relations">
+              {relations.map((link, index) => {
+                const from = nodeById.get(link.source);
+                const to = nodeById.get(link.target);
+                return (
+                  <li key={`${link.source}-${link.target}-${index}`}>
+                    <button
+                      type="button"
+                      onClick={() => select(link.source === selected.id ? link.target : link.source, { openExplore: true })}
+                    >
+                      {from && isEntity(from) ? from.name : ""} — {link.label} → {to && isEntity(to) ? to.name : ""}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : null}
+
+          <h2>Mentioned in</h2>
+          <ul className="graph-list">{entityMemories(selected).map(memoryListItem)}</ul>
+        </section>
+      );
+    }
+
+    return (
+      <>
+        {sharedEntities.length ? (
+          <section className="graph-detail" aria-label="Shared threads">
+            <h2>Shared threads</h2>
+            <p className="graph-note">Things both Leo and Mateo talk about. They are how a conversation can move from something Leo shared to a story Mateo can tell.</p>
+            <ul className="graph-chips">
+              {sharedEntities.map((entity) => (
+                <li key={entity.id}>
+                  <button type="button" onClick={() => select(entity.id, { openExplore: true })}>
+                    <i className={`graph-swatch graph-swatch--${entity.kind}`} aria-hidden="true" />
+                    {entity.name}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <button className="graph-button graph-button--quiet" type="button" onClick={showShared}>
+              Highlight on the graph
+            </button>
+          </section>
+        ) : null}
+
+        {memories.length > 0 ? (
+          <section className="graph-detail" aria-label="All memories">
+            <h2>All memories</h2>
+            <ul className="graph-list">{[...memories].reverse().map(memoryListItem)}</ul>
+          </section>
+        ) : null}
+      </>
+    );
+  };
 
   return (
     <div className="experience graph-page">
@@ -546,7 +790,7 @@ export function MemoryGraphView() {
                     if (!from || !to) return null;
 
                     const active = linkIsActive(link);
-                    const dim = focusId !== null && !active;
+                    const dim = emphasis !== null && !active;
 
                     return (
                       <g key={`${link.type}-${link.source}-${link.target}-${index}`}>
@@ -559,7 +803,10 @@ export function MemoryGraphView() {
                           x2={to.x}
                           y2={to.y}
                         />
-                        {link.type === "RELATED_TO" && active && link.label ? (
+                        {link.type === "RELATED_TO" &&
+                        active &&
+                        link.label &&
+                        (emphasis?.center !== null || (link.memoryId && emphasis?.ids.has(link.memoryId))) ? (
                           <text
                             className="graph-link-label"
                             x={(from.x + to.x) / 2}
@@ -577,6 +824,37 @@ export function MemoryGraphView() {
                   {data?.nodes.filter(isMemory).map(renderNode)}
                 </g>
               </svg>
+
+              <details className="graph-key">
+                <summary>Key</summary>
+                <ul aria-label="Key">
+                  <li>
+                    <svg viewBox="-16 -16 32 32" aria-hidden="true"><circle className="graph-ring" r="11" /></svg>
+                    Shared by Leo
+                  </li>
+                  <li>
+                    <svg viewBox="-16 -16 32 32" aria-hidden="true">
+                      <circle className="graph-story" r="12" />
+                      <text className="graph-glyph" textAnchor="middle" dominantBaseline="central">✣</text>
+                    </svg>
+                    Mateo’s own stories
+                  </li>
+                  <li>
+                    <svg viewBox="-16 -16 32 32" aria-hidden="true">
+                      <circle className="graph-halo" r="11" />
+                      <circle className="graph-dot graph-dot--place" r="6" />
+                    </svg>
+                    Shared by both
+                  </li>
+                  {KIND_ORDER.map((kind) => (
+                    <li key={kind}>
+                      <svg viewBox="-16 -16 32 32" aria-hidden="true"><circle className={`graph-dot graph-dot--${kind}`} r="7" /></svg>
+                      {KIND_LABEL[kind]}
+                    </li>
+                  ))}
+                </ul>
+                <p>Dots are derived: an index over the memories, never a memory itself.</p>
+              </details>
 
               <div className="graph-controls" role="group" aria-label="Zoom">
                 <button type="button" onClick={() => zoomBy(1.25)} aria-label="Zoom in">+</button>
@@ -600,7 +878,7 @@ export function MemoryGraphView() {
           {state.status === "error" ? (
             <div className="graph-state" role="alert">
               <p>{state.message}</p>
-              <button className="graph-button" type="button" onClick={() => void load()}>Try again</button>
+              <button className="graph-button" type="button" onClick={() => void refresh()}>Try again</button>
             </div>
           ) : null}
 
@@ -613,12 +891,12 @@ NEO4J_URI=bolt://localhost:7687
 NEO4J_PASSWORD=emori-local-dev
 npm run memory:seed`}</pre>
               {state.missing.length ? <p className="graph-note">Missing: {state.missing.join(", ")}</p> : null}
-              <button className="graph-button" type="button" onClick={() => void load()}>Check again</button>
+              <button className="graph-button" type="button" onClick={() => void refresh()}>Check again</button>
             </div>
           ) : null}
         </section>
 
-        <aside className="graph-panel" aria-label="Memory details">
+        <aside className="graph-panel" aria-label="Memory tools">
           <Eyebrow warm>MEMORY GRAPH</Eyebrow>
           <h1>How memories connect</h1>
           <p className="graph-intro">
@@ -629,162 +907,90 @@ npm run memory:seed`}</pre>
           {data ? (
             <p className="graph-stats">
               {data.stats.memories} memories · {data.stats.entities} connections · {data.stats.links} links
+              {sharedIds.size ? ` · ${sharedIds.size} shared` : ""}
             </p>
           ) : null}
 
-          <ul className="graph-legend" aria-label="Key">
-            <li>
-              <svg viewBox="-16 -16 32 32" aria-hidden="true"><circle className="graph-ring" r="11" /></svg>
-              Shared by Leo
-            </li>
-            <li>
-              <svg viewBox="-16 -16 32 32" aria-hidden="true">
-                <circle className="graph-story" r="12" />
-                <text className="graph-glyph" textAnchor="middle" dominantBaseline="central">✣</text>
-              </svg>
-              Mateo’s own stories
-            </li>
-            {KIND_ORDER.map((kind) => (
-              <li key={kind}>
-                <svg viewBox="-16 -16 32 32" aria-hidden="true"><circle className={`graph-dot graph-dot--${kind}`} r="7" /></svg>
-                {KIND_LABEL[kind]} <span className="graph-legend__hint">derived</span>
-              </li>
-            ))}
-          </ul>
-
-          <div aria-live="polite">{notice ? <p className="graph-notice" role="status">{notice}</p> : null}</div>
-
-          {selected && isMemory(selected) ? (
-            <section className="graph-detail" aria-label="Selected memory">
-              <p className={`graph-chip${selected.source === "mateo_story" ? " graph-chip--story" : ""}`}>
-                {selected.source === "mateo_story" ? "✣ " : ""}
-                {sourceLabel(selected)}
-              </p>
-              <blockquote>{selected.text}</blockquote>
-              <p className="graph-meta">
-                Saved {formatDate(selected.createdAt)}
-                {selected.eventDate ? ` · about ${selected.eventDate}` : ""}
-              </p>
-
-              <h2>Connected through</h2>
-              {[...(adjacency.get(selected.id) ?? [])].length ? (
-                <ul className="graph-chips">
-                  {[...(adjacency.get(selected.id) ?? [])]
-                    .map((id) => nodeById.get(id))
-                    .filter((node): node is GraphEntityNode => !!node && isEntity(node))
-                    .map((entity) => (
-                      <li key={entity.id}>
-                        <button type="button" onClick={() => select(entity.id)}>
-                          <i className={`graph-swatch graph-swatch--${entity.kind}`} aria-hidden="true" />
-                          {entity.name}
-                        </button>
-                      </li>
-                    ))}
-                </ul>
-              ) : (
-                <p className="graph-note">Nothing found yet.</p>
-              )}
-              <p className="graph-note">{describeExtractor(selected)}</p>
-
-              {selected.source === "user" ? (
-                confirmingDelete ? (
-                  <div className="graph-confirm" role="group" aria-label="Confirm erase">
-                    <p>Erase this memory permanently?</p>
-                    <button className="graph-button graph-button--danger" type="button" disabled={busy} onClick={() => void eraseMemory(selected.id)}>
-                      Yes, erase it
-                    </button>
-                    <button className="graph-button graph-button--quiet" type="button" onClick={() => setConfirmingDelete(false)}>
-                      Keep it
-                    </button>
-                  </div>
-                ) : (
-                  <button className="graph-button graph-button--quiet" type="button" onClick={() => setConfirmingDelete(true)}>
-                    Erase memory
-                  </button>
-                )
-              ) : null}
-            </section>
-          ) : null}
-
-          {selected && isEntity(selected) ? (
-            <section className="graph-detail" aria-label="Selected connection">
-              <p className="graph-chip">
-                <i className={`graph-swatch graph-swatch--${selected.kind}`} aria-hidden="true" />
-                {KIND_LABEL[selected.kind]} · derived
-              </p>
-              <h2 className="graph-entity-name">{selected.name}</h2>
-              <p className="graph-meta">
-                In {selected.mentions} {selected.mentions === 1 ? "memory" : "memories"}
-              </p>
-
-              {relationsOf(selected).length ? (
-                <ul className="graph-relations">
-                  {relationsOf(selected).map((link, index) => (
-                    <li key={`${link.source}-${link.target}-${index}`}>
-                      <button type="button" onClick={() => select(link.source === selected.id ? link.target : link.source)}>
-                        {nodeById.get(link.source)?.type === "entity" ? (nodeById.get(link.source) as GraphEntityNode).name : ""}
-                        {" — "}
-                        {link.label}
-                        {" → "}
-                        {nodeById.get(link.target)?.type === "entity" ? (nodeById.get(link.target) as GraphEntityNode).name : ""}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              ) : null}
-
-              <h2>Mentioned in</h2>
-              <ul className="graph-list">
-                {entityMemories(selected).map((memory) => (
-                  <li key={memory.id}>
-                    <button type="button" onClick={() => select(memory.id)}>
-                      <span className="graph-list__source">
-                        {memory.source === "mateo_story" ? "✣ Mateo’s story" : "Leo"}
-                      </span>
-                      {snippet(memory.text, 110)}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-              <button className="graph-button graph-button--quiet" type="button" onClick={() => select(null)}>
-                Back to all memories
-              </button>
-            </section>
-          ) : null}
-
-          {!selected && memories.length > 0 ? (
-            <section className="graph-detail" aria-label="All memories">
-              <h2>All memories</h2>
-              <ul className="graph-list">
-                {[...memories].reverse().map((memory) => (
-                  <li key={memory.id}>
-                    <button type="button" onClick={() => select(memory.id)}>
-                      <span className="graph-list__source">
-                        {memory.source === "mateo_story" ? "✣ Mateo’s story" : "Leo"}
-                      </span>
-                      {snippet(memory.text, 110)}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ) : null}
-
           {state.status === "ready" ? (
-            <form className="graph-form" onSubmit={saveMemory}>
-              <label htmlFor="graph-memory-text">Add a memory</label>
-              <textarea
-                id="graph-memory-text"
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                placeholder="Something Mateo should remember, in your own words…"
-                rows={3}
-                disabled={busy}
-              />
-              <button className="graph-button" type="submit" disabled={busy || !draft.trim()}>
-                {busy ? "Saving…" : "Save memory"}
-              </button>
-            </form>
+            <>
+              <div role="tablist" aria-label="Memory tools" className="graph-tabs">
+                {TABS.map((item) => (
+                  <button
+                    key={item.id}
+                    id={`graph-tab-${item.id}`}
+                    role="tab"
+                    type="button"
+                    aria-selected={tab === item.id}
+                    aria-controls={`graph-panel-${item.id}`}
+                    tabIndex={tab === item.id ? 0 : -1}
+                    onClick={() => setTab(item.id)}
+                    onKeyDown={onTabKeyDown}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+
+              <div aria-live="polite">{notice ? <p className="graph-notice" role="status">{notice}</p> : null}</div>
+
+              {highlight ? (
+                <div className="graph-banner">
+                  <span>{highlight.label}</span>
+                  <button type="button" onClick={clearHighlight}>Clear</button>
+                </div>
+              ) : null}
+
+              <div role="tabpanel" id="graph-panel-explore" aria-labelledby="graph-tab-explore" hidden={tab !== "explore"}>
+                {selected ? (
+                  <>
+                    <button className="graph-back-link" type="button" onClick={() => select(null)}>← All memories</button>
+                    {exploreDetail()}
+                    <div className="graph-trace">
+                      <label htmlFor="graph-trace">Trace a connection to…</label>
+                      <select id="graph-trace" value={traceTarget} onChange={(event) => trace(selected.id, event.target.value)}>
+                        <option value="">Choose a memory or connection</option>
+                        <optgroup label="Memories">
+                          {traceOptions.filter(isMemory).map((node) => (
+                            <option key={node.id} value={node.id}>{nodeName(node)}</option>
+                          ))}
+                        </optgroup>
+                        <optgroup label="Connections">
+                          {traceOptions.filter(isEntity).map((node) => (
+                            <option key={node.id} value={node.id}>{nodeName(node)}</option>
+                          ))}
+                        </optgroup>
+                      </select>
+                      {tracePath ? (
+                        <ol className="graph-path" aria-label="Path">
+                          {tracePath.map((id) => {
+                            const node = nodeById.get(id);
+                            return node ? (
+                              <li key={id}>
+                                <button type="button" onClick={() => select(id, { keepHighlight: true })}>{nodeName(node)}</button>
+                              </li>
+                            ) : null;
+                          })}
+                        </ol>
+                      ) : null}
+                    </div>
+                  </>
+                ) : (
+                  exploreDetail()
+                )}
+              </div>
+
+              <div role="tabpanel" id="graph-panel-add" aria-labelledby="graph-tab-add" hidden={tab !== "add"}>
+                <AddPanel agent={agent} onSaved={onSaved} />
+              </div>
+
+              <div role="tabpanel" id="graph-panel-ask" aria-labelledby="graph-tab-ask" hidden={tab !== "ask"}>
+                <AskPanel
+                  agent={agent}
+                  onAnswer={onAnswer}
+                  onCite={(id) => select(id, { keepHighlight: true, openExplore: true })}
+                />
+              </div>
+            </>
           ) : null}
         </aside>
       </main>
