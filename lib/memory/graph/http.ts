@@ -1,4 +1,4 @@
-import { MemoryInputError } from "./types";
+import { MemoryInputError, ModelError } from "./types";
 
 const UNREACHABLE_CODES = new Set(["ServiceUnavailable", "SessionExpired", "ECONNREFUSED", "ENOTFOUND"]);
 
@@ -6,6 +6,11 @@ const UNREACHABLE_CODES = new Set(["ServiceUnavailable", "SessionExpired", "ECON
 export function memoryGraphErrorResponse(error: unknown): Response {
   if (error instanceof MemoryInputError) {
     return Response.json({ error: error.message }, { status: 400 });
+  }
+
+  if (error instanceof ModelError) {
+    console.error("Model request failed:", error.message);
+    return Response.json({ error: "The model could not complete that. Try again." }, { status: 502 });
   }
 
   console.error("Memory graph request failed:", error);

@@ -85,6 +85,8 @@ export type SaveMemoryInput = {
   runtime?: AgentRuntimeConfig;
   /** Pre-computed extraction, e.g. hand-authored seed data. Validated like model output. */
   extraction?: unknown;
+  /** Label recorded on the derived edges when `extraction` is supplied. Defaults to "seed". */
+  extractor?: string;
 };
 
 export type SaveMemoryResult = {
@@ -153,7 +155,7 @@ export async function saveMemory(input: SaveMemoryInput): Promise<SaveMemoryResu
   try {
     extraction =
       input.extraction !== undefined
-        ? normalizeExtraction(input.extraction, text, "seed")
+        ? normalizeExtraction(input.extraction, text, input.extractor ?? "seed")
         : await extractMemoryGraph(text, input.runtime);
     await writeGraph((tx) => linkExtraction(tx, id, extraction));
     memory = {
@@ -242,6 +244,23 @@ export async function recallMemories(
 
   const recent = await listMemories({ ownerIds, limit: recentLimit });
   return recent.map((memory) => ({ ...memory, reason: "recent" as const }));
+}
+
+const ASK_CONTEXT_ALL = 12;
+
+/**
+ * Memories to answer a question from. While the graph is small the model sees all of them,
+ * oldest first, so questions like "what do these have in common?" work. Once it outgrows
+ * that, fall back to recall so the context stays relevant.
+ */
+export async function memoriesForQuestion(question: string): Promise<MemoryRecord[]> {
+  const everything = await listMemories({ limit: ASK_CONTEXT_ALL + 1 });
+
+  if (everything.length <= ASK_CONTEXT_ALL) {
+    return everything.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  return recallMemories(question, { limit: 6, relatedLimit: 4 });
 }
 
 export async function getMemoryGraph(options: { ownerIds?: string[] } = {}): Promise<MemoryGraphData> {

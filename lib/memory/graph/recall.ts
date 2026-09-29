@@ -1,4 +1,4 @@
-import { OWNER_NAMES, type RecalledMemory } from "./types";
+import { OWNER_NAMES, type MemoryRecord, type RecalledMemory } from "./types";
 
 const STOPWORDS = new Set([
   "about", "after", "again", "all", "also", "and", "any", "are", "because", "been", "before",
@@ -37,7 +37,8 @@ export function recallQueryFromMessages(messages: Array<{ role: string; content:
     .slice(-1_000);
 }
 
-function label(memory: RecalledMemory): string {
+/** Who a memory came from, e.g. "Shared by Leo · about 2023-03" or "Mateo's own story". */
+export function provenanceLabel(memory: MemoryRecord & { via?: string[] }): string {
   const when = memory.eventDate ? ` · about ${memory.eventDate}` : "";
   const origin =
     memory.source === "mateo_story"
@@ -53,6 +54,6 @@ function label(memory: RecalledMemory): string {
  */
 export function formatMemoriesForPrompt(memories: RecalledMemory[]): string {
   return memories
-    .map((memory) => `[${label(memory)}]\n${memory.text.replace(/<\/?durable-memory>/gi, "").trim()}`)
+    .map((memory) => `[${provenanceLabel(memory)}]\n${memory.text.replace(/<\/?durable-memory>/gi, "").trim()}`)
     .join("\n\n");
 }

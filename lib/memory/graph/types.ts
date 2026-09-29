@@ -29,6 +29,14 @@ export class MemoryInputError extends Error {
   }
 }
 
+/** The model failed, timed out, or returned something unusable. Distinct from bad user input. */
+export class ModelError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ModelError";
+  }
+}
+
 export type ExtractedEntity = { key: string; name: string; kind: EntityKind };
 /** `from` and `to` are entity keys. */
 export type ExtractedRelation = { from: string; to: string; label: string };
@@ -75,6 +83,9 @@ export type GraphLink = {
   /** For RELATED_TO: the memory that stated the relation. */
   memoryId?: string;
 };
+/** Whether a chat model is available for the scout and Q&A. Never includes keys. */
+export type AgentStatus = { configured: true; model: string } | { configured: false; missing?: string[] };
+
 export type MemoryGraphData = {
   nodes: GraphNode[];
   links: GraphLink[];
