@@ -1042,6 +1042,36 @@ textarea:focus-visible {
   padding: 28px 40px 20px;
 }
 
+.graph-connection {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 20px 0 auto;
+  color: #b8aa95;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.graph-connection i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #8fa3b8;
+  box-shadow: 0 0 12px rgba(143, 163, 184, 0.7);
+}
+
+.graph-connection--aura i {
+  background: #58c99d;
+  box-shadow: 0 0 12px rgba(88, 201, 157, 0.7);
+}
+
+.graph-connection--local i {
+  background: var(--gold);
+  box-shadow: 0 0 12px rgba(241, 181, 80, 0.7);
+}
+
 .graph-back {
   color: #b8aa95;
   font-size: 16px;
@@ -1540,6 +1570,12 @@ textarea:focus-visible {
 @media (max-width: 960px) {
   .graph-header {
     padding: 20px 17px 14px;
+  }
+
+  .graph-connection {
+    margin-right: 12px;
+    font-size: 10px;
+    letter-spacing: 0.04em;
   }
 
   .graph-layout {

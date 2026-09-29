@@ -1,4 +1,4 @@
-import { inspectMemoryGraph } from "@/lib/memory/graph/config";
+import { describeMemoryGraphConnection, inspectMemoryGraph } from "@/lib/memory/graph/config";
 import { NO_STORE, memoryGraphErrorResponse } from "@/lib/memory/graph/http";
 import { getMemoryGraph } from "@/lib/memory/graph/repository";
 
@@ -13,7 +13,8 @@ export async function GET() {
 
   try {
     const graph = await getMemoryGraph();
-    return Response.json({ configured: true, ...graph }, { headers: NO_STORE });
+    const connection = describeMemoryGraphConnection(status.config.uri);
+    return Response.json({ configured: true, connection, ...graph }, { headers: NO_STORE });
   } catch (error) {
     return memoryGraphErrorResponse(error);
   }

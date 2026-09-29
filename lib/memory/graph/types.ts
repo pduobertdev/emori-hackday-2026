@@ -80,3 +80,9 @@ export type MemoryGraphData = {
   links: GraphLink[];
   stats: { memories: number; entities: number; links: number };
 };
+
+export type MemoryGraphConnection = {
+  kind: "aura" | "local" | "remote";
+  label: string;
+  instance?: string;
+};

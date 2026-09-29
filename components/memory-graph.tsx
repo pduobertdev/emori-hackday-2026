@@ -29,6 +29,7 @@ import type {
   GraphLink,
   GraphMemoryNode,
   GraphNode,
+  MemoryGraphConnection,
   MemoryGraphData,
 } from "../lib/memory/graph/types";
 
@@ -36,7 +37,7 @@ type LoadState =
   | { status: "loading" }
   | { status: "unconfigured"; missing: string[] }
   | { status: "error"; message: string }
-  | { status: "ready"; data: MemoryGraphData };
+  | { status: "ready"; data: MemoryGraphData; connection: MemoryGraphConnection };
 
 type SimNode = SimulationNodeDatum & { id: string; radius: number };
 type SimLink = SimulationLinkDatum<SimNode> & { link: GraphLink };
@@ -85,13 +86,22 @@ async function fetchGraphState(): Promise<LoadState> {
   try {
     const response = await fetch("/api/memory/graph", { cache: "no-store" });
     const body = (await response.json().catch(() => null)) as
-      | (Partial<MemoryGraphData> & { configured?: boolean; missing?: string[]; error?: string })
+      | (Partial<MemoryGraphData> & {
+          configured?: boolean;
+          connection?: MemoryGraphConnection;
+          missing?: string[];
+          error?: string;
+        })
       | null;
 
     if (!response.ok) throw new Error(body?.error || "The memory graph could not be loaded.");
     if (!body || body.configured === false) return { status: "unconfigured", missing: body?.missing ?? [] };
 
-    return { status: "ready", data: body as MemoryGraphData };
+    return {
+      status: "ready",
+      data: body as MemoryGraphData,
+      connection: body.connection ?? { kind: "remote", label: "Remote Neo4j" },
+    };
   } catch (error) {
     return {
       status: "error",
@@ -503,6 +513,13 @@ export function MemoryGraphView() {
     <div className="experience graph-page">
       <header className="graph-header">
         <Brand />
+        {state.status === "ready" ? (
+          <p className={`graph-connection graph-connection--${state.connection.kind}`}>
+            <i aria-hidden="true" />
+            Connected to {state.connection.label}
+            {state.connection.instance ? ` · ${state.connection.instance}…` : ""}
+          </p>
+        ) : null}
         <Link className="graph-back" href="/">
           ← Back to Mateo
         </Link>
