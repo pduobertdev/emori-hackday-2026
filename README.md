@@ -60,4 +60,12 @@ The first request creates three uniqueness constraints and a full-text index, so
 
 **Entity extraction.** When `AI_PROVIDER`/`AI_MODEL` are configured, the chat model finds the entities in each new memory. Anything it returns is validated: names must appear verbatim in the memory, and dates need an explicit year. Without a model, or if it fails, a simple word-matching fallback runs and the result is labelled as such.
 
-`npm test` also runs the Neo4j integration tests when `NEO4J_URI` is set. They use throwaway owner IDs and leave the demo data alone.
+**The graph page** (`/memory`) has three tabs:
+
+- **Explore.** Click a memory or a connection to see it. Dashed halos mark *shared threads*, the things both Leo's memories and Mateo's stories mention. Pick "Trace a connection to…" to see the shortest path between two nodes. This needs no model.
+- **Add.** Add a memory by hand, or paste something Leo wrote and let the **memory scout** propose passages worth keeping. Each proposal is an exact quote, and nothing is saved until you approve it.
+- **Ask.** Ask a question of the saved memories. The answer cites the memories it used, lights them up on the graph, and is labelled AI-generated and never saved.
+
+The scout and Ask need a chat model, set up the same way as Mateo's chat (`AI_PROVIDER`, `AI_MODEL` and its API key in `.env.local`). They are disabled with a note when none is configured. The rule they follow, that agents propose and people approve, is recorded in [ADR-0002](docs/adr/0002-agents-propose-people-approve.md). The storage decision is in [ADR-0001](docs/adr/0001-neo4j-memory-graph.md).
+
+`npm test` also runs the Neo4j integration tests when `NEO4J_URI` is set. They use unique names and a mock model, and remove everything they add, so the demo data is left as it was.

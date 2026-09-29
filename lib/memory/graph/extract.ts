@@ -7,6 +7,7 @@ import {
   type ExtractedEntity,
   type ExtractedRelation,
   type Extraction,
+  ModelError,
 } from "./types";
 
 const MAX_ENTITIES = 12;
@@ -243,11 +244,24 @@ Rules:
 export function parseModelJson(output: string): unknown {
   const start = output.indexOf("{");
   const end = output.lastIndexOf("}");
-  if (start === -1 || end <= start) throw new Error("The model did not return a JSON object.");
-  return JSON.parse(output.slice(start, end + 1));
+  if (start === -1 || end <= start) throw new ModelError("The model did not return a JSON object.");
+
+  try {
+    return JSON.parse(output.slice(start, end + 1));
+  } catch (error) {
+    throw new ModelError("The model returned malformed JSON.", { cause: error });
+  }
 }
 
-async function extractWithModel(text: string, runtime: AgentRuntimeConfig, timeoutMs: number) {
+/**
+ * One plain chat completion through the configured OpenAI-compatible provider. Shared by
+ * extraction and the agents so they behave the same on OpenRouter and Crusoe: no tool calling
+ * or structured-output mode is required, the caller parses and validates the text.
+ */
+export async function askModel(
+  runtime: AgentRuntimeConfig,
+  request: { system: string; prompt: string; maxOutputTokens?: number; timeoutMs?: number },
+): Promise<string> {
   const provider = createOpenAICompatible({
     name: runtime.provider,
     apiKey: runtime.apiKey,
@@ -255,17 +269,31 @@ async function extractWithModel(text: string, runtime: AgentRuntimeConfig, timeo
     headers: runtime.headers,
   });
 
-  const result = await generateText({
-    model: provider.chatModel(runtime.model),
+  try {
+    const result = await generateText({
+      model: provider.chatModel(runtime.model),
+      system: request.system,
+      prompt: request.prompt,
+      temperature: 0,
+      maxOutputTokens: request.maxOutputTokens ?? 800,
+      maxRetries: 1,
+      abortSignal: AbortSignal.timeout(request.timeoutMs ?? LLM_TIMEOUT_MS),
+    });
+
+    return result.text;
+  } catch (error) {
+    throw new ModelError(error instanceof Error ? error.message : "The model request failed.", { cause: error });
+  }
+}
+
+async function extractWithModel(text: string, runtime: AgentRuntimeConfig, timeoutMs: number) {
+  const output = await askModel(runtime, {
     system: EXTRACTION_INSTRUCTIONS,
     prompt: `<memory>\n${text.replace(/<\/?memory>/gi, "")}\n</memory>`,
-    temperature: 0,
-    maxOutputTokens: 800,
-    maxRetries: 1,
-    abortSignal: AbortSignal.timeout(timeoutMs),
+    timeoutMs,
   });
 
-  return normalizeExtraction(parseModelJson(result.text), text, `llm:${runtime.model}`);
+  return normalizeExtraction(parseModelJson(output), text, `llm:${runtime.model}`);
 }
 
 /**

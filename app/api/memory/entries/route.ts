@@ -18,7 +18,10 @@ export async function POST(request: Request) {
     return Response.json({ error: "The request body must be valid JSON." }, { status: 400 });
   }
 
-  const body = payload && typeof payload === "object" ? (payload as { text?: unknown; eventDate?: unknown }) : {};
+  const body =
+    payload && typeof payload === "object"
+      ? (payload as { text?: unknown; eventDate?: unknown; via?: unknown; extraction?: unknown })
+      : {};
 
   if (typeof body.text !== "string") {
     return Response.json({ error: "Send a text string." }, { status: 400 });
@@ -27,8 +30,14 @@ export async function POST(request: Request) {
     return Response.json({ error: "The event date must be a string." }, { status: 400 });
   }
 
+  // Connections found by the scout are only honoured for a scout-approved passage.
+  const scoutExtraction =
+    body.via === "scout" && body.extraction && typeof body.extraction === "object"
+      ? body.extraction
+      : undefined;
+
   try {
-    const saved = await saveUserMemory({ text: body.text, eventDate: body.eventDate });
+    const saved = await saveUserMemory({ text: body.text, eventDate: body.eventDate, scoutExtraction });
     return Response.json(saved, { status: 201, headers: NO_STORE });
   } catch (error) {
     return memoryGraphErrorResponse(error);
