@@ -2,6 +2,8 @@
 
 A responsive, voice-first AI memory experience built with Next.js, React, and a provider-neutral AI SDK runtime.
 
+[Hack Day presentation — Emori and technology status](https://docs.google.com/presentation/d/1uqjcIV5vcXak-V-jks1FKxcrtw8k2UFOTksA5vIFw-Y/edit?slide=id.emori_tech_status#slide=id.emori_tech_status)
+
 ## Getting started
 
 ```bash
