@@ -8,17 +8,21 @@
     "start": "next start",
     "lint": "eslint .",
     "agent": "tsx scripts/run-agent.ts",
+    "memory:seed": "tsx scripts/seed-memory-graph.ts",
     "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "^3.0.59",
     "@next/env": "^16.3.7",
     "ai": "^7.0.122",
+    "d3-force": "^3.0.0",
+    "neo4j-driver": "^6.2.0",
     "next": "latest",
     "react": "latest",
     "react-dom": "latest"
   },
   "devDependencies": {
+    "@types/d3-force": "^3.0.10",
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",

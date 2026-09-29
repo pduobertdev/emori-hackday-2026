@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { CloseIcon } from "./icons";
 
@@ -35,6 +36,7 @@ export function MemoryDialog({ open, onClose }: MemoryDialogProps) {
   const [memoryText, setMemoryText] = useState("");
   const [status, setStatus] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+  const [usesGraph, setUsesGraph] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -58,9 +60,11 @@ export function MemoryDialog({ open, onClose }: MemoryDialogProps) {
 
     void fetch("/api/memory", { cache: "no-store" })
       .then(async (response) => {
-        const result = (await response.json()) as { text?: string; error?: string };
+        const result = (await response.json()) as { text?: string; store?: string; error?: string };
         if (!response.ok) throw new Error(result.error || "Could not load memory.");
-        if (!cancelled) setMemoryText(result.text || "");
+        if (cancelled) return;
+        setUsesGraph(result.store === "neo4j");
+        setMemoryText(result.text || "");
       })
       .catch((error) => {
         if (!cancelled) setStatus(error instanceof Error ? error.message : "Could not load memory.");
@@ -82,9 +86,16 @@ export function MemoryDialog({ open, onClose }: MemoryDialogProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: memoryText }),
       });
-      const result = (await response.json()) as { error?: string };
+      const result = (await response.json()) as { store?: string; entities?: number; error?: string };
       if (!response.ok) throw new Error(result.error || "Could not save memory.");
-      setStatus("Text saved for future conversations.");
+
+      if (result.store === "neo4j") {
+        // The graph appends memories, so clear the box instead of leaving text to re-save.
+        setMemoryText("");
+        setStatus(`Saved as a new memory. Found ${result.entities ?? 0} connections.`);
+      } else {
+        setStatus("Text saved for future conversations.");
+      }
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not save memory.");
     } finally {
@@ -134,7 +145,7 @@ export function MemoryDialog({ open, onClose }: MemoryDialogProps) {
         <section className="memory-sample" aria-labelledby="memory-sample-title">
           <h3 id="memory-sample-title">DURABLE SAMPLE</h3>
           <form onSubmit={saveText}>
-            <label htmlFor="memory-sample-text">Reference text</label>
+            <label htmlFor="memory-sample-text">{usesGraph ? "Add a memory" : "Reference text"}</label>
             <textarea
               id="memory-sample-text"
               value={memoryText}
@@ -160,6 +171,11 @@ export function MemoryDialog({ open, onClose }: MemoryDialogProps) {
             <button type="submit" disabled={isSaving}>Upload image</button>
           </form>
           {status ? <p className="memory-sample__status" role="status">{status}</p> : null}
+          {usesGraph ? (
+            <p className="memory-sample__status">
+              <Link href="/memory">See how your memories connect →</Link>
+            </p>
+          ) : null}
         </section>
 
         <div className="memory-timeline">
