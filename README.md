@@ -1,8 +1,11 @@
 # Emori — Mateo
 
-A responsive, voice-first AI memory experience built with Next.js, React, and a provider-neutral AI SDK runtime.
+Emori lets someone give a memory that another person can talk with. The giver records a story in their own words, reviews it, and approves what can be shared. The recipient opens it on a phone and asks questions. Emori answers from the recorded memory and says when a detail was not recorded; it does not pretend to be the storyteller. Mateo and Leo are fictional demo characters.
 
-[Hack Day presentation — Emori and technology status](https://docs.google.com/presentation/d/1uqjcIV5vcXak-V-jks1FKxcrtw8k2UFOTksA5vIFw-Y/edit?slide=id.emori_tech_status#slide=id.emori_tech_status)
+This Hack Day prototype uses a Next.js and React interface, Neo4j for the exact memory text and its connections, and a provider-neutral AI runtime for grounded answers when a model is configured. Voice transcription is optional. DuploCloud media analysis is planned, not deployed in this demo.
+
+- [Open the live Emori demo](https://emori-hackday-2026.vercel.app/)
+- [View the Hack Day presentation](https://docs.google.com/presentation/d/1uqjcIV5vcXak-V-jks1FKxcrtw8k2UFOTksA5vIFw-Y/edit?slide=id.emori_tech_status#slide=id.emori_tech_status)
 
 ## Getting started
 
