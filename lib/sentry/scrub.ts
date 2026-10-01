@@ -11,6 +11,8 @@
 //   personal-content routes (memory, chat, voice).
 // - Bearer tokens, JWTs, provider API keys (sk-, sk_live_, whsec_...) and `token=...`
 //   pairs in free text are redacted.
+// - IP-bearing headers (x-forwarded-for, x-real-ip, forwarded, cf-connecting-ip...) are filtered
+//   and request.env (REMOTE_ADDR) is dropped.
 // - User context keeps only the id.
 
 import type { Breadcrumb, Event } from "@sentry/nextjs";
@@ -21,7 +23,11 @@ export const EMAIL_PLACEHOLDER = "[email]";
 const EMAIL_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,}/gi;
 
 const SENSITIVE_KEY_PATTERN =
-  /e[-_]?mail|token|passw|pwd|secret|cookie|authori[sz]ation|^auth$|api[-_]?key|private[-_]?key|session|csrf|xsrf|signature|^otp$|verification[-_]?code|card[-_]?number|^cvc$|^cvv$|^dsn$|^code$|^state$/i;
+  /e[-_]?mail|token|passw|pwd|secret|cookie|authori[sz]ation|^auth$|api[-_]?key|private[-_]?key|session|csrf|xsrf|signature|^otp$|verification[-_]?code|card[-_]?number|^cvc$|^cvv$|^dsn$|forwarded|real[-_]?ip|client[-_]?ip|connecting[-_]?ip|remote[-_]?addr|ip[-_]?address|^ip$/i;
+
+// OAuth `code` / `state` are only secret as URL query params; as object keys they're usually
+// harmless debugging data (e.g. { code: "ECONNREFUSED" }), so they're filtered in query strings only.
+const SENSITIVE_QUERY_KEY_PATTERN = /^(code|state)$/i;
 
 const SENSITIVE_PATH_PATTERN = new RegExp(
   "(^|/)(" +
@@ -89,7 +95,9 @@ export function scrubQueryString(query: string): string {
     } catch {
       /* keep raw key */
     }
-    return isSensitiveKey(decodedKey) ? `${key}=${FILTERED}` : scrubString(pair);
+    return isSensitiveKey(decodedKey) || SENSITIVE_QUERY_KEY_PATTERN.test(decodedKey)
+      ? `${key}=${FILTERED}`
+      : scrubString(pair);
   });
   return parts.join("&") + (hash.length ? `#${hash.join("#")}` : "");
 }
@@ -116,7 +124,11 @@ export function scrubRequest(request: SentryRequest): SentryRequest {
   delete out.cookies;
 
   if (typeof out.url === "string" && isSensitivePath(pathOf(out.url))) {
+    // Drop body AND query string on auth/billing/personal-content routes.
     delete out.data;
+    delete out.query_string;
+    const q = out.url.indexOf("?");
+    if (q !== -1) out.url = out.url.slice(0, q);
   } else if (out.data !== undefined) {
     out.data = scrubValue(out.data);
   }
@@ -125,7 +137,8 @@ export function scrubRequest(request: SentryRequest): SentryRequest {
   if (typeof out.url === "string") out.url = scrubUrl(out.url);
   if (typeof out.query_string === "string") out.query_string = scrubQueryString(out.query_string);
   else if (out.query_string) out.query_string = scrubValue(out.query_string) as SentryRequest["query_string"];
-  if (out.env) out.env = scrubValue(out.env) as SentryRequest["env"];
+  // Server env (REMOTE_ADDR etc.) is never useful enough to justify the IP leak risk.
+  delete out.env;
   return out;
 }
 
@@ -144,6 +157,10 @@ export function scrubBreadcrumb(breadcrumb: Breadcrumb): Breadcrumb {
 export function scrubEvent<T extends Event>(event: T): T {
   if (event.request) event.request = scrubRequest(event.request);
   if (typeof event.message === "string") event.message = scrubString(event.message);
+  if (event.logentry) {
+    if (typeof event.logentry.message === "string") event.logentry.message = scrubString(event.logentry.message);
+    if (event.logentry.params) event.logentry.params = scrubValue(event.logentry.params) as unknown[];
+  }
   if (typeof event.transaction === "string") event.transaction = scrubUrl(event.transaction);
 
   for (const ex of event.exception?.values ?? []) {

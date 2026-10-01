@@ -10,22 +10,45 @@ export function tracesSampleRate(raw: string | undefined): number {
 
 /**
  * @param dsn Sentry DSN from the environment. Empty/undefined means Sentry is fully disabled.
+ * @param environment Deploy environment (VERCEL_ENV on the server, NEXT_PUBLIC_VERCEL_ENV in the browser).
  *
  * @sentry/nextjs v11 removed `sendDefaultPii`; its replacement is `dataCollection`. Everything that
  * sendDefaultPii=false used to keep out (user identity/IP, cookies, request bodies, query values)
  * is turned off here, plus gen-AI prompts/outputs, DB params and stack-frame local variables.
  */
-export function sentryOptions(dsn: string | undefined, rawRate: string | undefined) {
+export function sentryOptions(dsn: string | undefined, rawRate: string | undefined, environment?: string) {
   const enabled = typeof dsn === "string" && dsn.trim() !== "";
   return {
     dsn: enabled ? dsn : undefined,
     enabled,
-    environment: process.env.VERCEL_ENV ?? process.env.NODE_ENV,
+    environment: environment || process.env.NODE_ENV,
     tracesSampleRate: tracesSampleRate(rawRate),
     dataCollection: {
       userInfo: false,
       cookies: false,
-      httpHeaders: { request: { deny: ["authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "x-csrf-token", "x-xsrf-token"] }, response: false },
+      httpHeaders: {
+        request: {
+          deny: [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+            "x-csrf-token",
+            "x-xsrf-token",
+            // IP-bearing headers (sendDefaultPii=false never sent the client IP)
+            "x-forwarded-for",
+            "x-real-ip",
+            "forwarded",
+            "true-client-ip",
+            "cf-connecting-ip",
+            "x-client-ip",
+            "x-vercel-forwarded-for",
+            "x-vercel-proxied-for",
+          ],
+        },
+        response: false,
+      },
       httpBodies: [],
       urlQueryParams: false,
       genAI: { inputs: false, outputs: false },

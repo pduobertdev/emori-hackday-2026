@@ -53,13 +53,21 @@ test("cookies are dropped and auth headers filtered", () => {
         "x-csrf-token": "c",
         "stripe-signature": "t=1,v1=x",
         "x-api-key": "k",
+        "x-forwarded-for": "203.0.113.9",
+        "x-real-ip": "203.0.113.9",
+        "cf-connecting-ip": "203.0.113.9",
+        forwarded: "for=203.0.113.9",
         "user-agent": "Mozilla/5.0",
       },
+      env: { REMOTE_ADDR: "203.0.113.9" },
     },
   } as Event);
+  assert.equal(event.request?.env, undefined);
   assert.equal(event.request?.cookies, undefined);
   const h = event.request?.headers as Record<string, string>;
-  for (const k of ["authorization", "Cookie", "x-csrf-token", "stripe-signature", "x-api-key"]) assert.equal(h[k], FILTERED, k);
+  for (const k of ["authorization", "Cookie", "x-csrf-token", "stripe-signature", "x-api-key", "x-forwarded-for", "x-real-ip", "cf-connecting-ip", "forwarded"]) {
+    assert.equal(h[k], FILTERED, k);
+  }
   assert.equal(h["user-agent"], "Mozilla/5.0");
 });
 
@@ -85,8 +93,12 @@ const sensitive = [
 for (const path of sensitive) {
   test(`request body dropped on ${path}`, () => {
     assert.ok(isSensitivePath(path));
-    const event = scrubEvent({ request: { url: `https://emori.example${path}`, data: { text: "hello" } } } as Event);
+    const event = scrubEvent({
+      request: { url: `https://emori.example${path}?q=hello`, query_string: "q=hello", data: { text: "hello" } },
+    } as Event);
     assert.equal(event.request?.data, undefined);
+    assert.equal(event.request?.query_string, undefined);
+    assert.equal(event.request?.url, `https://emori.example${path}`);
   });
 }
 
@@ -136,6 +148,23 @@ test("user keeps only id; breadcrumbs, tags, contexts, spans and frame vars scru
   assert.deepEqual(event.exception?.values?.[0].stacktrace?.frames?.[0].vars, { password: FILTERED, n: 1 });
   assert.equal(event.spans?.[0].description, `GET https://api.x.io/u?email=${FILTERED}`);
   assert.deepEqual(event.spans?.[0].data, { authorization: FILTERED });
+});
+
+test("code/state are filtered as query params but kept as object keys; logentry scrubbed", () => {
+  const event = scrubEvent({
+    extra: { code: "ECONNREFUSED", state: "open" },
+    logentry: { message: "login for %s by a@b.co", params: ["j@x.io", { token: "t" }] },
+  } as Event);
+  assert.deepEqual(event.extra, { code: "ECONNREFUSED", state: "open" });
+  assert.equal(event.logentry?.message, `login for %s by ${EMAIL_PLACEHOLDER}`);
+  assert.deepEqual(event.logentry?.params, [EMAIL_PLACEHOLDER, { token: FILTERED }]);
+});
+
+test("environment comes from the caller, falling back to NODE_ENV", () => {
+  assert.equal(sentryOptions("https://public@o0.ingest.sentry.io/0", undefined, "preview").environment, "preview");
+  assert.equal(sentryOptions("https://public@o0.ingest.sentry.io/0", undefined, undefined).environment, process.env.NODE_ENV);
+  const deny = (sentryOptions("x", undefined).dataCollection.httpHeaders.request as { deny: string[] }).deny;
+  for (const h of ["authorization", "cookie", "x-forwarded-for", "x-real-ip", "forwarded", "cf-connecting-ip"]) assert.ok(deny.includes(h), h);
 });
 
 test("standalone breadcrumb scrubbing", () => {
