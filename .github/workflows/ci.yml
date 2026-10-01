@@ -1,0 +1,58 @@
+# CI for emori-hackday-2026: runs tests, lint and the production build on
+# every push and PR. Security: read-only token, every action pinned to a full
+# commit SHA, no secrets, no credential persistence, no deploy steps.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test-lint-build:
+    name: Tests, lint, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Dummy, non-secret values only. Tests and build don't call any external
+    # service. NEO4J_* is deliberately left unset: the Neo4j integration tests
+    # skip themselves without it (setting dummy values would make them try to
+    # connect and fail).
+    env:
+      CI: 'true'
+      NEXT_TELEMETRY_DISABLED: '1'
+      AI_PROVIDER: openrouter
+      AI_MODEL: ci/dummy-model
+      OPENROUTER_API_KEY: ci-dummy-not-a-real-key
+      APP_URL: http://localhost:3000
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      # --ignore-scripts: dependency install scripts are not needed for these
+      # checks, so don't run third-party lifecycle scripts in CI.
+      - name: Install npm dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Tests
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
