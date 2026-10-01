@@ -496,3 +496,24 @@ test("POST /api/memory/image returns 400 (not 500) for a non-multipart body", as
   });
   assert.equal((await imagePost(request)).status, 400);
 });
+
+test("POST /api/memory/image enforces a per-USER limit, even from rotating IPs (L1)", async () => {
+  process.env.RATE_LIMIT_MODEL = "1:60"; // per-user limit = 1
+  process.env.RATE_LIMIT_MODEL_IP = "100:60"; // per-IP generous, so the user limit is what fires
+  __resetRateLimitsForTests();
+  const tok = token({ tenantId: "demo", userId: "img-rl-user", role: "demo" });
+
+  const img = (ip: string) =>
+    new Request("http://localhost/api", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", authorization: `Bearer ${tok}`, "x-real-ip": ip },
+      body: JSON.stringify({ not: "multipart" }),
+    });
+
+  // First call passes the limiter (then 400 for the non-multipart body); the second is blocked
+  // before the body is ever read, proving the limit sits right after requireSession.
+  assert.equal((await imagePost(img("1.1.1.1"))).status, 400);
+  const second = await imagePost(img("2.2.2.2")); // same user, fresh IP
+  assert.equal(second.status, 429, "the per-user limit blocks even from a new IP");
+  assert.ok(Number(second.headers.get("Retry-After")) > 0, "a Retry-After is set");
+});

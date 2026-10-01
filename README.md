@@ -99,7 +99,18 @@ is **ignored entirely** — off-Vercel it is fully client-controlled, so trustin
 let a caller mint a fresh bucket per request. If neither trusted header is present (off-Vercel, or
 behind a proxy that doesn't set `x-real-ip`), all requests share one `"unknown"` IP bucket — safe,
 since it only ever over-limits, and the per-user limit is the real control. **Deploy behind Vercel**
-(or a proxy that sets `x-real-ip`) for meaningful per-IP limits.
+(or a proxy that sets `x-real-ip`) for meaningful per-IP limits. The IP value is also sanitized before
+it becomes part of a key: it is validated with `node:net` (anything that isn't a real IPv4/IPv6 literal
+collapses to a single shared `"invalid"` bucket), IPv4 passes through unchanged, and **IPv6 is bucketed
+by its /64 prefix** (an ISP hands one customer a whole /64, so keying on the full address would let a
+single client mint unlimited buckets and defeat the per-IP limit); IPv4-mapped IPv6 (`::ffff:a.b.c.d`)
+is treated as its embedded IPv4.
+
+> **Vercel-only trust envelope.** The same assumption applies to the CSRF check below: `allowedHosts`
+> trusts the `Host` and `x-forwarded-host` headers. On Vercel these are platform-set and a browser
+> cannot inject them in a cross-site request, so this is safe. Off-Vercel, a host that forwards a
+> client-controlled `x-forwarded-host` would let a crafted write satisfy the origin check — which is
+> why this app is **Vercel-only**. Both the per-IP limiter and the origin check assume that envelope.
 
 **CSRF / origin check.** For cookie-authenticated state-changing requests (POST/PUT/DELETE/PATCH),
 the server rejects (`403`) a request whose `Origin` is not same-origin with the app host; with no

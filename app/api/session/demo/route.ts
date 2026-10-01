@@ -2,17 +2,13 @@ import {
   DEMO_SESSION_TTL_SECONDS,
   buildSessionCookie,
   createDemoSession,
+  demoAccessEnabled,
   getSessionSecret,
   signSession,
 } from "@/lib/auth/session";
 import { RATE_LIMITS, checkRateLimit, clientIp, rateLimitResponse } from "@/lib/auth/rate-limit";
 
 export const runtime = "nodejs";
-
-/** True only when the deployment opted the public demo in. Defaults to off. */
-function demoAccessEnabled(): boolean {
-  return process.env.EMORI_DEMO_ACCESS?.trim().toLowerCase() === "on";
-}
 
 /**
  * Issue a short-lived demo session so the public demo works with no login. Every call mints a
@@ -25,7 +21,7 @@ export async function POST(request: Request) {
     return Response.json({ error: "Not found." }, { status: 404 });
   }
 
-  const limited = checkRateLimit(`demo-mint:${clientIp(request)}`, RATE_LIMITS.demoMint());
+  const limited = checkRateLimit(`demo-mint:${clientIp(request)}`, RATE_LIMITS.demoMint(), "mint");
   if (!limited.ok) return rateLimitResponse(limited.retryAfterSeconds);
 
   const secret = getSessionSecret();

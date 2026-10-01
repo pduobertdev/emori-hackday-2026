@@ -4,6 +4,7 @@ import {
   COOKIE_NAME,
   DEMO_SESSION_TTL_SECONDS,
   createDemoSession,
+  demoAccessEnabled,
   getSessionSecret,
   signSession,
   verifySession,
@@ -19,7 +20,7 @@ import { RATE_LIMITS, checkRateLimit, clientIp } from "@/lib/auth/rate-limit";
  * Proxy runs on the Node.js runtime in this Next version, so node:crypto signing works here.
  */
 export function proxy(request: NextRequest) {
-  if (process.env.EMORI_DEMO_ACCESS?.trim().toLowerCase() !== "on") return NextResponse.next();
+  if (!demoAccessEnabled()) return NextResponse.next();
 
   const secret = getSessionSecret();
   if (!secret) return NextResponse.next();
@@ -31,7 +32,7 @@ export function proxy(request: NextRequest) {
   // throttled per IP. This uses the same key NAME as POST /api/session/demo (`demo-mint:<ip>`) but
   // NOT the same counter: the proxy and the route run as separate functions/instances, each with its
   // own in-memory Map, so the two budgets are independent — not a shared cap.
-  const limited = checkRateLimit(`demo-mint:${clientIp(request)}`, RATE_LIMITS.demoMint());
+  const limited = checkRateLimit(`demo-mint:${clientIp(request)}`, RATE_LIMITS.demoMint(), "mint");
   if (!limited.ok) {
     const blocked = NextResponse.json(
       { error: "Too many requests. Please slow down and try again shortly." },

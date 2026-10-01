@@ -89,9 +89,9 @@ export async function POST(request: Request) {
 
   // Per IP and per session user, so one abusive user can't drain the model budget and one busy
   // tenant can't crowd everyone sharing an egress IP.
-  const perIp = checkRateLimit(`chat:ip:${clientIp(request)}`, RATE_LIMITS.chat());
+  const perIp = checkRateLimit(`chat:ip:${clientIp(request)}`, RATE_LIMITS.chat(), "ip");
   if (!perIp.ok) return rateLimitResponse(perIp.retryAfterSeconds);
-  const perUser = checkRateLimit(`chat:user:${session.userId}`, RATE_LIMITS.chat());
+  const perUser = checkRateLimit(`chat:user:${session.userId}`, RATE_LIMITS.chat(), "user");
   if (!perUser.ok) return rateLimitResponse(perUser.retryAfterSeconds);
 
   const runtime = inspectAgentRuntime();

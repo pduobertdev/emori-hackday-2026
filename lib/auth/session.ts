@@ -62,7 +62,7 @@ export function getSessionSecret(env: Record<string, string | undefined> = proce
 }
 
 /** True only when the deployment opted the public demo in. Defaults to off. */
-function demoAccessEnabled(): boolean {
+export function demoAccessEnabled(): boolean {
   return process.env.EMORI_DEMO_ACCESS?.trim().toLowerCase() === "on";
 }
 

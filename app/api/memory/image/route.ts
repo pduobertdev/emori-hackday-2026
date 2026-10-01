@@ -1,3 +1,4 @@
+import { RATE_LIMITS, enforceIpAndUserLimit } from "@/lib/auth/rate-limit";
 import { requireSession } from "@/lib/auth/session";
 import { writeDurableImage } from "@/lib/memory/store";
 
@@ -8,6 +9,10 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 export async function POST(request: Request) {
   const session = requireSession(request);
   if (session instanceof Response) return session;
+
+  // Per IP and per user, before buffering up to 10 MB, so one visitor can't flood storage.
+  const limited = enforceIpAndUserLimit("model", session.userId, request, RATE_LIMITS.modelIp(), RATE_LIMITS.model());
+  if (limited) return limited;
 
   let formData: FormData;
   try {
