@@ -18,6 +18,14 @@ export const READABLE_OWNER_IDS = [USER_OWNER_ID, MATEO_OWNER_ID];
 
 export const MAX_MEMORY_LENGTH = 50_000;
 
+/** The tenant a row created before tenants existed belongs to. Keeps live Aura data readable. */
+export const LEGACY_TENANT_ID = "demo";
+
+/** Scope for reads: one tenant, a set of owners the caller may see. */
+export type ReadScope = { tenantId: string; ownerIds: string[] };
+/** Scope for writes and deletes: always exactly the caller's own tenant and owner. */
+export type WriteScope = { tenantId: string; ownerId: string };
+
 export function sourceForOwner(ownerId: string): MemorySource {
   return ownerId === MATEO_OWNER_ID ? "mateo_story" : "user";
 }

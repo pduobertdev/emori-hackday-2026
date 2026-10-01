@@ -1,4 +1,4 @@
-import { OWNER_NAMES, type MemoryRecord, type RecalledMemory } from "./types";
+import { type MemoryRecord, type RecalledMemory } from "./types";
 
 const STOPWORDS = new Set([
   "about", "after", "again", "all", "also", "and", "any", "are", "because", "been", "before",
@@ -37,13 +37,14 @@ export function recallQueryFromMessages(messages: Array<{ role: string; content:
     .slice(-1_000);
 }
 
-/** Who a memory came from, e.g. "Shared by Leo · about 2023-03" or "Mateo's own story". */
+/**
+ * Who a memory came from, e.g. "Shared by Leo · about 2023-03" or "Mateo's own story".
+ * Every user-shared memory reads as "Leo": in the demo each visitor role-plays Leo, so their
+ * own id (a random visitor id) must never surface in the label.
+ */
 export function provenanceLabel(memory: MemoryRecord & { via?: string[] }): string {
   const when = memory.eventDate ? ` · about ${memory.eventDate}` : "";
-  const origin =
-    memory.source === "mateo_story"
-      ? "Mateo's own story"
-      : `Shared by ${OWNER_NAMES[memory.ownerId] ?? "the user"}${when}`;
+  const origin = memory.source === "mateo_story" ? "Mateo's own story" : `Shared by Leo${when}`;
   const via = memory.via?.length ? ` · connected through ${memory.via.join(", ")}` : "";
   return `${origin}${via}`;
 }

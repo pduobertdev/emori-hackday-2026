@@ -18,18 +18,47 @@ export async function startMockModel() {
       lastBody = body;
       const content = typeof reply === "function" ? reply(body) : reply;
 
-      response.writeHead(status, { "Content-Type": "application/json" });
+      if (status !== 200) {
+        response.writeHead(status, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "mock failure" } }));
+        return;
+      }
+
+      // Streaming callers (e.g. the chat route) get Server-Sent Events; everyone else a single
+      // JSON completion. Detecting `"stream":true` keeps both shapes working from one server.
+      if (/"stream"\s*:\s*true/.test(body)) {
+        response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store" });
+        const event = (data: unknown) => response.write(`data: ${JSON.stringify(data)}\n\n`);
+        event({
+          id: "mock-1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "test-model",
+          choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }],
+        });
+        event({
+          id: "mock-1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "test-model",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+        response.write("data: [DONE]\n\n");
+        response.end();
+        return;
+      }
+
+      response.writeHead(200, { "Content-Type": "application/json" });
       response.end(
-        status === 200
-          ? JSON.stringify({
-              id: "mock-1",
-              object: "chat.completion",
-              created: 1,
-              model: "test-model",
-              choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
-              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-            })
-          : JSON.stringify({ error: { message: "mock failure" } }),
+        JSON.stringify({
+          id: "mock-1",
+          object: "chat.completion",
+          created: 1,
+          model: "test-model",
+          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
       );
     });
   });

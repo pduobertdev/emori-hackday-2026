@@ -1,3 +1,4 @@
+import { requireSession } from "@/lib/auth/session";
 import { writeDurableImage } from "@/lib/memory/store";
 
 export const runtime = "nodejs";
@@ -5,6 +6,9 @@ export const runtime = "nodejs";
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 export async function POST(request: Request) {
+  const session = requireSession(request);
+  if (session instanceof Response) return session;
+
   const formData = await request.formData();
   const image = formData.get("image");
 
@@ -20,7 +24,11 @@ export async function POST(request: Request) {
     return Response.json({ error: "The JPEG must be between 1 byte and 10 MB." }, { status: 400 });
   }
 
-  await writeDurableImage(new Uint8Array(await image.arrayBuffer()));
+  // Stored per tenant and user, so one visitor's reference image is never shown to another.
+  await writeDurableImage(
+    { tenantId: session.tenantId, userId: session.userId },
+    new Uint8Array(await image.arrayBuffer()),
+  );
 
-  return Response.json({ saved: true, filename: "memorysample-image.jpg" });
+  return Response.json({ saved: true });
 }

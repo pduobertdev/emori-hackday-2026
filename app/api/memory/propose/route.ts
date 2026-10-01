@@ -1,9 +1,9 @@
 import { inspectAgentRuntime } from "@/lib/agent/config";
+import { requireSession } from "@/lib/auth/session";
+import { memoryBackend } from "@/lib/memory/graph/backend";
 import { inspectMemoryGraph } from "@/lib/memory/graph/config";
 import { NO_STORE, memoryGraphErrorResponse } from "@/lib/memory/graph/http";
-import { listMemories } from "@/lib/memory/graph/repository";
 import { proposeMemories, userWords } from "@/lib/memory/graph/scout";
-import { USER_OWNER_ID } from "@/lib/memory/graph/types";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -16,6 +16,9 @@ const MAX_MESSAGE_LENGTH = 12_000;
  * not the user's own words (assistant messages) is dropped before the model sees it.
  */
 export async function POST(request: Request) {
+  const session = requireSession(request);
+  if (session instanceof Response) return session;
+
   if (!inspectMemoryGraph().configured) {
     return Response.json({ error: "The memory graph is not configured." }, { status: 503 });
   }
@@ -63,7 +66,11 @@ export async function POST(request: Request) {
   }
 
   try {
-    const existing = await listMemories({ ownerIds: [USER_OWNER_ID], limit: 500 });
+    // Dedupe only against the caller's own saved memories, in their own tenant.
+    const existing = await memoryBackend().listMemories(
+      { tenantId: session.tenantId, ownerIds: [session.userId] },
+      { limit: 500 },
+    );
     const proposals = await proposeMemories(typed, agent.config, existing);
     return Response.json({ proposals, model: agent.model }, { headers: NO_STORE });
   } catch (error) {

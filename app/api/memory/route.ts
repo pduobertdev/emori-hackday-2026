@@ -1,11 +1,16 @@
+import { requireSession } from "@/lib/auth/session";
 import { inspectMemoryGraph, isAuraMemoryGraph } from "@/lib/memory/graph/config";
 import { NO_STORE, memoryGraphErrorResponse } from "@/lib/memory/graph/http";
+import { writeScopeFor } from "@/lib/memory/graph/scope";
 import { saveUserMemory } from "@/lib/memory/graph/service";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-export async function GET() {
+export async function GET(request: Request) {
+  const session = requireSession(request);
+  if (session instanceof Response) return session;
+
   const graph = inspectMemoryGraph();
   if (!graph.configured || !isAuraMemoryGraph(graph.config)) {
     return Response.json(
@@ -18,6 +23,9 @@ export async function GET() {
 }
 
 export async function PUT(request: Request) {
+  const session = requireSession(request);
+  if (session instanceof Response) return session;
+
   let payload: unknown;
 
   try {
@@ -44,7 +52,7 @@ export async function PUT(request: Request) {
   }
 
   try {
-    const saved = await saveUserMemory({ text });
+    const saved = await saveUserMemory(writeScopeFor(session), { text });
     return Response.json({ saved: true, store: "neo4j", ...saved }, { headers: NO_STORE });
   } catch (error) {
     return memoryGraphErrorResponse(error);

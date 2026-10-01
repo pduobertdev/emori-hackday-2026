@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "agent": "tsx scripts/run-agent.ts",
     "memory:seed": "tsx scripts/seed-memory-graph.ts",
+    "session:mint": "tsx scripts/mint-session.ts",
     "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {

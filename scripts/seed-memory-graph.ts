@@ -3,9 +3,12 @@ import { closeMemoryGraph } from "../lib/memory/graph/client";
 import { inspectMemoryGraph } from "../lib/memory/graph/config";
 import { deleteOwnerData, listMemories, saveMemory } from "../lib/memory/graph/repository";
 import { SAMPLE_MEMORIES } from "../lib/memory/graph/sample";
-import { MATEO_OWNER_ID, USER_OWNER_ID } from "../lib/memory/graph/types";
+import { LEGACY_TENANT_ID, MATEO_OWNER_ID, USER_OWNER_ID } from "../lib/memory/graph/types";
 
 loadEnvConfig(process.cwd());
+
+// The fictional seed lives in the demo tenant, which is what public demo visitors read.
+const TENANT = LEGACY_TENANT_ID;
 
 async function main() {
   const status = inspectMemoryGraph();
@@ -18,7 +21,7 @@ async function main() {
   }
 
   const reset = process.argv.includes("--reset");
-  const existing = await listMemories({ limit: 1 });
+  const existing = await listMemories({ tenantId: TENANT, ownerIds: [USER_OWNER_ID, MATEO_OWNER_ID] }, { limit: 1 });
 
   if (existing.length > 0 && !reset) {
     console.log("The graph already has memories. Nothing was changed.");
@@ -27,14 +30,15 @@ async function main() {
   }
 
   if (reset) {
-    await deleteOwnerData(USER_OWNER_ID);
-    await deleteOwnerData(MATEO_OWNER_ID);
+    await deleteOwnerData({ tenantId: TENANT, ownerId: USER_OWNER_ID });
+    await deleteOwnerData({ tenantId: TENANT, ownerId: MATEO_OWNER_ID });
     console.log("Removed existing memories for Leo and Mateo.");
   }
 
   let entities = 0;
   for (const sample of SAMPLE_MEMORIES) {
     const result = await saveMemory({
+      tenantId: TENANT,
       ownerId: sample.ownerId,
       text: sample.text,
       eventDate: sample.eventDate,

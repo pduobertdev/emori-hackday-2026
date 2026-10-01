@@ -16,6 +16,41 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000). The prototype includes push-to-talk transcription, a text conversation view, and the “How Emori remembers” memory tab.
 
+## Auth and tenant isolation
+
+Every memory, chat and voice route requires a signed session; none of them act as a hardcoded
+user any more. A session is a stateless token — `base64url(JSON).base64url(HMAC-SHA256)`, signed
+with `EMORI_SESSION_SECRET` (≥32 chars) — carried either in the HttpOnly `emori_session` cookie
+or an `Authorization: Bearer <token>` header. With no secret set, every protected route fails
+closed with `401`. The auth check runs before any database or model check, so an unauthenticated
+caller never learns whether those are configured.
+
+Each token names a `tenantId`, a `userId`, and a role (`demo` or `member`). Memory and Person
+nodes carry a `tenantId`, and every read filters by it; a Person is keyed by `(tenantId, id)`, so
+the same id can never be shared across tenants. Writes and deletes always target the caller's own
+tenant and user — never values from the request body or query — and deleting a memory that is not
+yours returns `404` without revealing that it exists. Rows created before this change have no
+`tenantId` and are read as the `demo` tenant (`coalesce(m.tenantId,'demo')`), so existing AuraDB
+data keeps working with no migration.
+
+- **Demo (public, no login).** When `EMORI_DEMO_ACCESS=on`, a page load mints a fresh anonymous
+  visitor session in the `demo` tenant (role `demo`, 12h) via `proxy.ts`; `POST /api/session/demo`
+  does the same on demand. A visitor reads the shared fictional seed (Leo + Mateo) plus their own
+  writes, and can only add or delete their own memories — never the seed or another visitor's.
+  Their memories still read as "Leo" in the UI (they role-play Leo). **The Vercel deployment must
+  set `EMORI_SESSION_SECRET` and `EMORI_DEMO_ACCESS=on` for the public demo to keep working.**
+- **Members (real tenants).** There is no signup UI. Mint a token for a real tenant/user with:
+
+  ```bash
+  npm run session:mint -- --tenant acme --user alice            # 30-day token
+  npm run session:mint -- --tenant acme --user alice --ttl 3600 # custom TTL (seconds)
+  ```
+
+  A member reads only their own memories plus the tenant's curated storyteller.
+
+Model and voice routes accept demo sessions (that is the demo). Rate limiting per session is a
+sensible follow-up and is intentionally left out of this change.
+
 ## Agent runtime
 
 Copy `.env.example` to `.env.local`, choose `openrouter` or `crusoe`, and add a current model ID and the matching API key. Secrets stay on the server.
@@ -23,15 +58,19 @@ Copy `.env.example` to `.env.local`, choose `openrouter` or `crusoe`, and add a 
 The runtime can be used through the existing responsive interface, as a headless HTTP stream, or directly from the terminal:
 
 ```bash
+# Mint a session token once (needs EMORI_SESSION_SECRET set), then pass it as a Bearer token.
+TOKEN=$(npm run --silent session:mint -- --tenant acme --user alice)
+
 # Health and configuration status
-curl http://localhost:3000/api/chat
+curl http://localhost:3000/api/chat -H "Authorization: Bearer $TOKEN"
 
 # Headless HTTP request
 curl -N http://localhost:3000/api/chat \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello, Mateo."}]}'
 
-# Direct process, no browser or Next.js server required
+# Direct process, no browser or Next.js server required (no HTTP route, so no token needed)
 npm run agent -- "Hello, Mateo."
 ```
 

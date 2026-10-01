@@ -1,3 +1,5 @@
+import { requireSession } from "@/lib/auth/session";
+
 const ELEVENLABS_TRANSCRIPTION_URL = "https://api.elevenlabs.io/v1/speech-to-text";
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 
@@ -25,6 +27,9 @@ function getUpstreamError(payload: ElevenLabsTranscript) {
 }
 
 export async function POST(request: Request) {
+  const session = requireSession(request);
+  if (session instanceof Response) return session;
+
   const apiKey = process.env.ELEVENLABS_API_KEY?.trim();
 
   if (!apiKey) {

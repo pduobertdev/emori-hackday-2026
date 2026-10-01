@@ -7,7 +7,13 @@ type Holder = { driver: Driver; fingerprint: string; ready?: Promise<void> };
 const globalStore = globalThis as typeof globalThis & { __emoriMemoryGraph?: Holder };
 
 const SCHEMA = [
-  "CREATE CONSTRAINT person_id IF NOT EXISTS FOR (p:Person) REQUIRE p.id IS UNIQUE",
+  // A Person is identified by (tenantId, id), so the same logical id (e.g. "leo") can exist in
+  // different tenants without collision. The old single-property uniqueness on p.id would forbid
+  // that, so it is dropped. A composite uniqueness constraint is Enterprise-only (fine on Aura,
+  // unavailable on the local community image), so identity is enforced by MERGE keying on both
+  // properties and backed by a plain composite index, which community supports.
+  "DROP CONSTRAINT person_id IF EXISTS",
+  "CREATE INDEX person_tenant_id IF NOT EXISTS FOR (p:Person) ON (p.tenantId, p.id)",
   "CREATE CONSTRAINT memory_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.id IS UNIQUE",
   "CREATE CONSTRAINT entity_key IF NOT EXISTS FOR (e:Entity) REQUIRE e.key IS UNIQUE",
   // standard-folding matches "Lucia" against "Lucía".
@@ -40,11 +46,35 @@ function holderFor(config: MemoryGraphConfig): Holder {
   return holder;
 }
 
+// Two cold starts (serverless invocations, or parallel test files) can create the schema at the
+// same time. `IF NOT EXISTS` is not atomic across sessions, so the loser sees an "equivalent rule
+// already exists" error — harmless, the rule it wanted is there — or a transient lock/deadlock,
+// which just needs a retry. Both mean the schema is converging, not broken.
+const code = (error: unknown): string =>
+  (error && typeof error === "object" && "code" in error ? String((error as { code: unknown }).code) : "");
+
+async function runSchemaStatement(session: ReturnType<Driver["session"]>, statement: string) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await session.run(statement);
+      return;
+    } catch (error) {
+      const c = code(error);
+      if (c.includes("EquivalentSchemaRuleAlreadyExists")) return;
+      if (attempt < 5 && (c.includes("Transient") || c.includes("DeadlockDetected") || c.includes("LockClient"))) {
+        await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 async function ensureSchema(holder: Holder, config: MemoryGraphConfig) {
   holder.ready ??= (async () => {
     const session = holder.driver.session({ database: config.database });
     try {
-      for (const statement of SCHEMA) await session.run(statement);
+      for (const statement of SCHEMA) await runSchemaStatement(session, statement);
     } finally {
       await session.close();
     }
