@@ -28,7 +28,14 @@ export type StreamedSpanJSON = Parameters<NonNullable<NodeOptions["beforeSendSpa
 export const FILTERED = "[Filtered]";
 export const EMAIL_PLACEHOLDER = "[email]";
 
-const EMAIL_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)*\.[A-Z]{2,}/gi;
+// ReDoS safety: every quantifier in the patterns below is bounded, strings are truncated to
+// MAX_SCRUB_LENGTH before any regex runs, and the email regex only runs when the string has an "@".
+// Local part <= 64 chars, labels <= 63, <= 8 extra labels, TLD 2-24 (RFC 5321 limits).
+const EMAIL_PATTERN = /[A-Z0-9._%+-]{1,64}@[A-Z0-9-]{1,63}(?:\.[A-Z0-9-]{1,63}){0,8}\.[A-Z]{2,24}/gi;
+
+/** Strings longer than this are truncated (with a marker) before scrubbing. */
+export const MAX_SCRUB_LENGTH = 8192;
+export const TRUNCATED_MARKER = "…[truncated]";
 
 const SENSITIVE_KEY_PATTERN =
   /e[-_]?mail|token|passw|pwd|secret|cookie|authori[sz]ation|^auth$|api[-_]?key|private[-_]?key|session|csrf|xsrf|signature|^otp$|verification[-_]?code|card[-_]?number|^cvc$|^cvv$|^dsn$|forwarded|real[-_]?ip|client[-_]?ip|connecting[-_]?ip|remote[-_]?addr|ip[-_]?address|^ip$/i;
@@ -48,19 +55,22 @@ const SENSITIVE_PATH_PATTERN = new RegExp(
 
 const TOKEN_PATTERNS: Array<[RegExp, string]> = [
   // OpenRouter keys (sk-or-v1-...) and ElevenLabs keys (sk_ + 32+ chars)
-  [/\bsk-or-v1-[A-Za-z0-9]{16,}\b/g, FILTERED],
-  [/\bsk_[A-Za-z0-9]{32,}\b/g, FILTERED],
+  // (No trailing \b and no upper bound needed: a match attempt either fails within the minimum
+  // length or consumes the whole run, so these stay linear.)
+  [/\bsk-or-v1-[A-Za-z0-9]{16,}/g, FILTERED],
+  [/\bsk_[A-Za-z0-9]{32,}/g, FILTERED],
   // Sensitive params inside raw query strings/URLs embedded in free text: ?code=..&state=..&email=..
   [/([?&;])((?:code|state|e-?mail|otp)=)[^&#\s]*/gi, `$1$2${FILTERED}`],
-  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=|-]+/gi, `$1 ${FILTERED}`],
-  [/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, FILTERED],
-  [/\b\d+\|[A-Za-z0-9]{40,}\b/g, FILTERED],
+  [/\b(Bearer|Basic)\s{1,16}[A-Za-z0-9._~+/=|-]+/gi, `$1 ${FILTERED}`],
+  // JWT segments bounded (header/payload/signature) so "eyJ-eyJ-..." can't go quadratic.
+  [/\beyJ[A-Za-z0-9_-]{1,512}\.[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{0,1024}/g, FILTERED],
+  [/\b\d{1,20}\|[A-Za-z0-9]{40,}/g, FILTERED],
   [/\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]+\b/g, FILTERED],
   [/\bwhsec_[A-Za-z0-9]+\b/g, FILTERED],
   // OpenAI/OpenRouter-style keys: sk-..., sk-or-v1-...
   [/\bsk-[A-Za-z0-9_-]{16,}/g, FILTERED],
   [
-    /\b([A-Za-z_-]*(?:token|password|secret|api[_-]?key|email_hash)[A-Za-z_-]*)(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&,;]+)/gi,
+    /\b([A-Za-z_-]{0,32}(?:token|password|secret|api[_-]?key|email_hash)[A-Za-z_-]{0,32})(\s{0,8}[=:]\s{0,8})("[^"]{0,1024}"|'[^']{0,1024}'|[^\s&,;]+)/gi,
     `$1$2${FILTERED}`,
   ],
 ];
@@ -98,10 +108,25 @@ function decodeOnce(value: string): string {
       try {
         return decodeURIComponent(run);
       } catch {
-        return run;
+        // Invalid UTF-8 somewhere in the run (e.g. "%FF%40"): still decode every ASCII escape
+        // (%00-%7F) on its own so "bob%FF%40example.com" becomes "bob%FF@example.com".
+        return run.replace(/%([0-7][0-9A-Fa-f])/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
       }
     });
   }
+}
+
+/**
+ * Truncates strings longer than MAX_SCRUB_LENGTH (result incl. marker <= MAX_SCRUB_LENGTH) so no
+ * regex ever sees a huge input. A trailing partial token containing "@" (a cut-off email) is dropped.
+ */
+export function truncateForScrub(value: string): string {
+  if (value.length <= MAX_SCRUB_LENGTH) return value;
+  let out = value.slice(0, MAX_SCRUB_LENGTH - TRUNCATED_MARKER.length);
+  const tailStart = Math.max(out.length - 320, 0);
+  const lastSpace = Math.max(out.lastIndexOf(" "), out.lastIndexOf("\n"), out.lastIndexOf("\t"), tailStart - 1);
+  if (out.indexOf("@", lastSpace + 1) !== -1) out = out.slice(0, lastSpace + 1);
+  return out + TRUNCATED_MARKER;
 }
 
 /** Scrubs a string value according to its key: URL-ish keys via scrubUrl, query keys via scrubQueryString. */
@@ -120,7 +145,8 @@ export function isSensitivePath(path: string): boolean {
 }
 
 export function scrubString(value: string): string {
-  let out = safeDecode(value).replace(EMAIL_PATTERN, EMAIL_PLACEHOLDER);
+  let out = safeDecode(truncateForScrub(value));
+  if (out.includes("@")) out = out.replace(EMAIL_PATTERN, EMAIL_PLACEHOLDER);
   for (const [pattern, replacement] of TOKEN_PATTERNS) out = out.replace(pattern, replacement);
   return out;
 }
@@ -141,7 +167,7 @@ export function scrubValue(value: Json, depth = 0): Json {
 
 export function scrubQueryString(query: string): string {
   if (!query) return query;
-  const [q, ...hash] = query.split("#");
+  const [q, ...hash] = truncateForScrub(query).split("#");
   const parts = q.split("&").map((pair) => {
     const [key] = pair.split("=", 1);
     let decodedKey = key;
@@ -151,14 +177,14 @@ export function scrubQueryString(query: string): string {
       /* keep raw key */
     }
     return isSensitiveKey(decodedKey) || SENSITIVE_QUERY_KEY_PATTERN.test(decodedKey)
-      ? `${key}=${FILTERED}`
+      ? `${scrubString(key)}=${FILTERED}`
       : scrubString(pair);
   });
   return parts.join("&") + (hash.length ? `#${hash.join("#")}` : "");
 }
 
 export function scrubUrl(url: string): string {
-  let out = safeDecode(url).replace(URL_TOKEN_PATTERN, `/$1/${FILTERED}`);
+  let out = safeDecode(truncateForScrub(url)).replace(URL_TOKEN_PATTERN, `/$1/${FILTERED}`);
   const i = out.indexOf("?");
   if (i !== -1) out = out.slice(0, i + 1) + scrubQueryString(out.slice(i + 1));
   return scrubString(out);
@@ -237,12 +263,39 @@ export function scrubSpanAttributes<T extends SpanAttributes | undefined>(attrib
  * and span-link attributes. Never drops spans.
  */
 export function scrubStreamedSpan(span: StreamedSpanJSON): StreamedSpanJSON {
-  span.name = scrubUrl(span.name);
-  span.attributes = scrubSpanAttributes(span.attributes);
-  if (span.links) {
-    span.links = span.links.map((link) => ({ ...link, attributes: scrubSpanAttributes(link.attributes) }));
+  try {
+    span.name = scrubUrl(span.name);
+    span.attributes = scrubSpanAttributes(span.attributes);
+    if (span.links) {
+      span.links = span.links.map((link) => ({ ...link, attributes: scrubSpanAttributes(link.attributes) }));
+    }
+    return span;
+  } catch {
+    // Fail closed: if beforeSendSpan throws, the SDK sends the span UNSCRUBBED. Strip it instead.
+    return failClosedSpan(span);
   }
-  return span;
+}
+
+function failClosedSpan(span: StreamedSpanJSON): StreamedSpanJSON {
+  try {
+    span.name = FILTERED;
+    span.attributes = {} as StreamedSpanJSON["attributes"];
+    delete span.links;
+    return span;
+  } catch {
+    // The span object itself is hostile (e.g. non-writable); send a minimal copy.
+    return {
+      trace_id: String(span.trace_id),
+      span_id: String(span.span_id),
+      parent_span_id: span.parent_span_id,
+      start_timestamp: Number(span.start_timestamp),
+      end_timestamp: span.end_timestamp,
+      status: span.status === "ok" ? "ok" : "error",
+      is_segment: Boolean(span.is_segment),
+      name: FILTERED,
+      attributes: {} as StreamedSpanJSON["attributes"],
+    };
+  }
 }
 
 /**
@@ -250,7 +303,34 @@ export function scrubStreamedSpan(span: StreamedSpanJSON): StreamedSpanJSON {
  * `transaction` is the raw root span name. Mutates in place (the SDK's `createDsc` hook contract).
  */
 export function scrubDsc(dsc: Record<string, unknown>): void {
-  if (typeof dsc.transaction === "string") dsc.transaction = scrubUrl(dsc.transaction);
+  try {
+    if (typeof dsc.transaction === "string") dsc.transaction = scrubUrl(dsc.transaction);
+  } catch {
+    // Fail closed: never let a raw root span name reach the envelope header / baggage.
+    try {
+      dsc.transaction = FILTERED;
+    } catch {
+      /* non-writable: nothing more we can do from a void hook */
+    }
+  }
+}
+
+/** `beforeSend`: scrub, or DROP the event (null) if scrubbing throws. Never sends unscrubbed. */
+export function safeBeforeSend<T extends Event>(event: T): T | null {
+  try {
+    return scrubEvent(event);
+  } catch {
+    return null;
+  }
+}
+
+/** `beforeBreadcrumb`: scrub, or drop the breadcrumb (null) if scrubbing throws. */
+export function safeBeforeBreadcrumb(breadcrumb: Breadcrumb): Breadcrumb | null {
+  try {
+    return scrubBreadcrumb(breadcrumb);
+  } catch {
+    return null;
+  }
 }
 
 /** Scrubs an event in place and returns it. Never drops events. */
@@ -267,6 +347,10 @@ export function scrubEvent<T extends Event>(event: T): T {
     if (typeof ex.value === "string") ex.value = scrubString(ex.value);
     for (const frame of ex.stacktrace?.frames ?? []) {
       if (frame.vars) frame.vars = scrubValue(frame.vars) as typeof frame.vars;
+      // Source-context lines (Node contextLines integration) can contain literals with PII/secrets.
+      if (typeof frame.context_line === "string") frame.context_line = scrubString(frame.context_line);
+      if (frame.pre_context) frame.pre_context = frame.pre_context.map((l) => scrubString(l));
+      if (frame.post_context) frame.post_context = frame.post_context.map((l) => scrubString(l));
     }
   }
 

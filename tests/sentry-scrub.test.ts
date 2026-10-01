@@ -8,6 +8,12 @@ import {
   isSensitivePath,
   scrubBreadcrumb,
   scrubEvent,
+  MAX_SCRUB_LENGTH,
+  TRUNCATED_MARKER,
+  safeBeforeBreadcrumb,
+  safeBeforeSend,
+  scrubDsc,
+  scrubQueryString,
   scrubStreamedSpan,
   scrubString,
   scrubUrl,
@@ -272,4 +278,170 @@ test("options: streaming kept with beforeSendSpan wired", () => {
   const o = sentryOptions("x", undefined);
   assert.equal(o.traceLifecycle, "stream");
   assert.equal(typeof o.beforeSendSpan, "function");
+});
+
+// ---- Security round 2 ----
+
+const gen = (chars: string, n: number) => {
+  let out = "";
+  for (let i = 0; i < n; i++) out += chars[(i * 7) % chars.length];
+  return out;
+};
+const ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789";
+const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+
+test("ReDoS: 100K-char adversarial strings scrub in well under 50ms", () => {
+  const N = 100_000;
+  const inputs: Record<string, string> = {
+    alnum: gen(ALNUM, N),
+    "alnum+@": gen(ALNUM, N / 2) + "@" + gen(ALNUM, N / 2),
+    "alnum@end": gen(ALNUM, N) + "@",
+    base64: gen(B64, N),
+    "base64+@": gen(B64, N / 2) + "@" + gen(B64, N / 2),
+    "many-@": "a@b".repeat(N / 3),
+    "label-dots": "a@" + "a.".repeat(N / 2),
+    dashes: "a-".repeat(N / 2),
+    "eyJ-run": "eyJ-".repeat(N / 4),
+    "sk-run": "sk-".repeat(N / 3),
+    "token-run": "token_".repeat(N / 6),
+    "bad-pct": "%FF%40".repeat(N / 6),
+  };
+  for (const [name, input] of Object.entries(inputs)) {
+    for (const fn of [scrubString, scrubUrl, scrubQueryString]) {
+      fn(input); // warm-up (JIT)
+      const t = performance.now();
+      const out = fn(input);
+      const ms = performance.now() - t;
+      assert.ok(ms < 50, `${fn.name}(${name}) took ${ms.toFixed(1)}ms`);
+      // (+ room for a trailing "=[Filtered]" when the whole input is one sensitive query key)
+      assert.ok(out.length <= MAX_SCRUB_LENGTH + 16, `${fn.name}(${name}) not truncated`);
+    }
+  }
+});
+
+test("strings over 8KB are truncated with a marker before any regex runs", () => {
+  const long = "x".repeat(20_000);
+  const out = scrubString(long);
+  assert.ok(out.endsWith(TRUNCATED_MARKER));
+  assert.ok(out.length <= MAX_SCRUB_LENGTH);
+  assert.equal(scrubString("short"), "short");
+  // An email cut in half at the boundary is dropped, not leaked partially.
+  const cut = "y ".repeat((MAX_SCRUB_LENGTH - TRUNCATED_MARKER.length - 10) / 2) + "jane.doe@example.com" + "z".repeat(10_000);
+  const cutOut = scrubString(cut);
+  assert.ok(!cutOut.includes("jane"), "partial email leaked at truncation boundary");
+  assert.ok(cutOut.endsWith(TRUNCATED_MARKER));
+  // Emails before the cut are still scrubbed.
+  assert.ok(scrubString("mail jane@x.io " + "q".repeat(20_000)).startsWith(`mail ${EMAIL_PLACEHOLDER} `));
+});
+
+test("sensitive query keys are themselves scrubbed (no raw key leak)", () => {
+  assert.equal(scrubQueryString("my_token_jane@x.io=abc&n=1"), `${EMAIL_PLACEHOLDER}=${FILTERED}&n=1`);
+});
+
+test("(a) one invalid %XX in a run no longer hides an encoded @", () => {
+  assert.equal(scrubString("user bob%FF%40example.com"), `user ${EMAIL_PLACEHOLDER}`);
+  assert.equal(scrubUrl("/x?u=bob%FF%40example.com&n=1"), `/x?u=${EMAIL_PLACEHOLDER}&n=1`);
+  // Non-ASCII invalid bytes stay encoded; valid multi-byte UTF-8 still decodes.
+  assert.equal(scrubString("caf%C3%A9 %FF"), "café %FF");
+});
+
+test("fail closed: scrubStreamedSpan strips the span if scrubbing throws", () => {
+  const span = {
+    trace_id: "t",
+    span_id: "s",
+    name: "GET /?email=bob@ex.com",
+    start_timestamp: 1,
+    status: "error",
+    is_segment: true,
+    attributes: {},
+  } as unknown as Parameters<typeof scrubStreamedSpan>[0];
+  Object.defineProperty(span, "attributes", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throw new Error("boom");
+    },
+    set(v) {
+      Object.defineProperty(span, "attributes", { value: v, writable: true, enumerable: true, configurable: true });
+    },
+  });
+  const out = scrubStreamedSpan(span);
+  assert.equal(out.name, FILTERED);
+  assert.deepEqual(out.attributes, {});
+  assert.ok(!JSON.stringify(out).includes("bob@ex.com"));
+});
+
+test("fail closed: beforeSend drops the event (null) and beforeBreadcrumb drops the crumb if scrubbing throws", () => {
+  const hostile = {
+    message: "for jane@x.io",
+    get request(): never {
+      throw new Error("boom");
+    },
+  } as unknown as Event;
+  assert.equal(safeBeforeSend(hostile), null);
+  assert.equal(safeBeforeSend({ message: "for jane@x.io" } as Event)?.message, `for ${EMAIL_PLACEHOLDER}`);
+  const crumb = {
+    get message(): never {
+      throw new Error("boom");
+    },
+  };
+  assert.equal(safeBeforeBreadcrumb(crumb as never), null);
+});
+
+test("fail closed: scrubDsc filters the transaction if scrubbing throws", () => {
+  const dsc: Record<string, unknown> = { transaction: "GET /cb?code=OAUTHCODE" };
+  scrubDsc(dsc);
+  assert.equal(dsc.transaction, `GET /cb?code=${FILTERED}`);
+  let stored: unknown = "x";
+  const hostile: Record<string, unknown> = {};
+  let first = true;
+  Object.defineProperty(hostile, "transaction", {
+    get() {
+      if (first) {
+        first = false;
+        return { toString: () => "never a string" } as unknown; // typeof !== string: untouched
+      }
+      return stored;
+    },
+    set(v) {
+      stored = v;
+    },
+  });
+  scrubDsc(hostile); // non-string: no-op, no throw
+  const throwing: Record<string, unknown> = {};
+  Object.defineProperty(throwing, "transaction", {
+    get() {
+      return "GET /cb?code=OAUTHCODE";
+    },
+    set(v) {
+      if (v !== FILTERED) throw new Error("boom");
+      stored = v;
+    },
+  });
+  scrubDsc(throwing);
+  assert.equal(stored, FILTERED);
+});
+
+test("stack frame source-context lines are scrubbed", () => {
+  const event = scrubEvent({
+    exception: {
+      values: [
+        {
+          type: "Error",
+          value: "x",
+          stacktrace: {
+            frames: [
+              {
+                context_line: 'fetch("/cb?code=OAUTHCODE&email=bob%40ex.com")',
+                pre_context: ['const key = "sk-or-v1-ABCDEFGHIJKLMNOPQRST";'],
+                post_context: ["// owner jane@x.io"],
+              },
+            ],
+          },
+        },
+      ],
+    },
+  } as Event);
+  const json = JSON.stringify(event);
+  for (const leak of ["OAUTHCODE", "bob@ex.com", "sk-or-v1-ABCD", "jane@x.io"]) assert.ok(!json.includes(leak), leak);
 });

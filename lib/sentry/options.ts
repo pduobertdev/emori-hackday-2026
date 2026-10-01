@@ -1,10 +1,14 @@
 // Shared Sentry.init options for client, server and edge. Privacy first, quota friendly.
 import type { BrowserOptions, NodeOptions } from "@sentry/nextjs";
-import { scrubBreadcrumb, scrubDsc, scrubEvent, scrubStreamedSpan } from "./scrub";
+import { safeBeforeBreadcrumb, safeBeforeSend, scrubDsc, scrubStreamedSpan } from "./scrub";
 
 type HookableClient = { on(hook: "createDsc", callback: (dsc: Record<string, unknown>) => void): unknown };
 
-/** Call right after Sentry.init: scrubs the DSC (envelope `trace` header / baggage), which no before* hook covers. */
+/**
+ * Call right after Sentry.init: scrubs the DSC (envelope `trace` header / baggage), which no before*
+ * hook covers. Defense in depth only: span (beforeSendSpan) and event (beforeSend) scrubbing remain the
+ * primary protection; the DSC only carries the root span name, which Next.js sets to the route.
+ */
 export function installPrivacyHooks(client: HookableClient | undefined): void {
   client?.on("createDsc", scrubDsc);
 }
@@ -67,8 +71,8 @@ export function sentryOptions(dsn: string | undefined, rawRate: string | undefin
     // We keep streaming (the SDK's default and future path; beforeSendTransaction is removed in v12)
     // and scrub every span with beforeSendSpan instead. Pinned explicitly so the hook always matches.
     traceLifecycle: "stream",
-    beforeSend: (event) => scrubEvent(event),
+    beforeSend: (event) => safeBeforeSend(event),
     beforeSendSpan: (span) => scrubStreamedSpan(span),
-    beforeBreadcrumb: (breadcrumb) => scrubBreadcrumb(breadcrumb),
+    beforeBreadcrumb: (breadcrumb) => safeBeforeBreadcrumb(breadcrumb),
   } satisfies BrowserOptions & NodeOptions;
 }
