@@ -1,6 +1,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { POST } from "../app/api/voice/transcribe/route";
+import { createSession, signSession } from "../lib/auth/session";
+
+const SECRET = "voice-secret-0123456789-abcdefghij";
+
+function authed(body: FormData): Request {
+  process.env.EMORI_SESSION_SECRET = SECRET;
+  // A member token: role-independent, so it does not depend on EMORI_DEMO_ACCESS being on.
+  const token = signSession(createSession({ tenantId: "acme", userId: "alice", role: "member", ttlSeconds: 3600 }), SECRET);
+  return new Request("http://localhost/api/voice/transcribe", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+    body,
+  });
+}
+
+test("the voice route rejects an unauthenticated request before anything else", async () => {
+  process.env.EMORI_SESSION_SECRET = SECRET;
+  const response = await POST(new Request("http://localhost/api/voice/transcribe", { method: "POST", body: new FormData() }));
+  assert.equal(response.status, 401);
+});
 
 test("the voice route forwards browser audio to ElevenLabs Scribe v2", async () => {
   const originalFetch = globalThis.fetch;
@@ -29,10 +49,7 @@ test("the voice route forwards browser audio to ElevenLabs Scribe v2", async () 
       new File(["mock audio"], "recording.webm", { type: "audio/webm" }),
     );
 
-    const response = await POST(new Request("http://localhost/api/voice/transcribe", {
-      method: "POST",
-      body: formData,
-    }));
+    const response = await POST(authed(formData));
 
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { text: "A remembered summer afternoon." });
@@ -47,15 +64,12 @@ test("the voice route forwards browser audio to ElevenLabs Scribe v2", async () 
   }
 });
 
-test("the voice route reports a missing ElevenLabs key", async () => {
+test("an authenticated request reports a missing ElevenLabs key", async () => {
   const originalApiKey = process.env.ELEVENLABS_API_KEY;
   delete process.env.ELEVENLABS_API_KEY;
 
   try {
-    const response = await POST(new Request("http://localhost/api/voice/transcribe", {
-      method: "POST",
-      body: new FormData(),
-    }));
+    const response = await POST(authed(new FormData()));
 
     assert.equal(response.status, 503);
     assert.match(JSON.stringify(await response.json()), /ELEVENLABS_API_KEY/);

@@ -1,11 +1,16 @@
 import type { ModelMessage } from "ai";
 import { inspectAgentRuntime } from "@/lib/agent/config";
 import { createMateoAgent } from "@/lib/agent/mateo";
+import { RATE_LIMITS, checkRateLimit, clientIp, rateLimitResponse } from "@/lib/auth/rate-limit";
+import { requireSession, type Session } from "@/lib/auth/session";
+import { memoryBackend } from "@/lib/memory/graph/backend";
 import { inspectMemoryGraph } from "@/lib/memory/graph/config";
 import { formatMemoriesForPrompt, recallQueryFromMessages } from "@/lib/memory/graph/recall";
-import { recallMemories } from "@/lib/memory/graph/repository";
+import { readScopeFor } from "@/lib/memory/graph/scope";
+import { LEGACY_TENANT_ID } from "@/lib/memory/graph/types";
 import { readDurableImage, readDurableMemory } from "@/lib/memory/store";
 
+export const runtime = "nodejs";
 export const maxDuration = 60;
 
 type IncomingMessage = {
@@ -29,28 +34,37 @@ function isIncomingMessage(value: unknown): value is IncomingMessage {
 
 type MemoryStore = "graph" | "file" | "file-fallback";
 
+/** The fictional seed flat file belongs to the demo tenant; no other tenant may read it. */
+async function readSeedFileFor(session: Session): Promise<string> {
+  return session.tenantId === LEGACY_TENANT_ID ? await readDurableMemory() : "";
+}
+
 /**
- * Recall what is relevant to this conversation from the memory graph. If the graph is not
- * configured, use the flat file. If it is configured but fails, degrade to the flat file
- * rather than break the conversation.
+ * Recall what is relevant to this conversation from the memory graph, scoped to the caller.
+ * If the graph is not configured, fall back to the flat seed file (demo tenant only). If it is
+ * configured but fails, degrade to that same fallback rather than break the conversation.
  */
 async function loadDurableMemory(
   messages: IncomingMessage[],
+  session: Session,
 ): Promise<{ text: string; store: MemoryStore }> {
   if (!inspectMemoryGraph().configured) {
-    return { text: await readDurableMemory(), store: "file" };
+    return { text: await readSeedFileFor(session), store: "file" };
   }
 
   try {
-    const recalled = await recallMemories(recallQueryFromMessages(messages));
+    const recalled = await memoryBackend().recallMemories(recallQueryFromMessages(messages), readScopeFor(session));
     return { text: formatMemoriesForPrompt(recalled), store: "graph" };
   } catch (error) {
     console.error("Memory recall failed; falling back to the flat file:", error);
-    return { text: await readDurableMemory(), store: "file-fallback" };
+    return { text: await readSeedFileFor(session), store: "file-fallback" };
   }
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  const session = requireSession(request);
+  if (session instanceof Response) return session;
+
   const status = inspectAgentRuntime();
 
   if (!status.configured) {
@@ -70,6 +84,16 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  const session = requireSession(request);
+  if (session instanceof Response) return session;
+
+  // Per IP and per session user, so one abusive user can't drain the model budget and one busy
+  // tenant can't crowd everyone sharing an egress IP.
+  const perIp = checkRateLimit(`chat:ip:${clientIp(request)}`, RATE_LIMITS.chat(), "ip");
+  if (!perIp.ok) return rateLimitResponse(perIp.retryAfterSeconds);
+  const perUser = checkRateLimit(`chat:user:${session.userId}`, RATE_LIMITS.chat(), "user");
+  if (!perUser.ok) return rateLimitResponse(perUser.retryAfterSeconds);
+
   const runtime = inspectAgentRuntime();
   if (!runtime.configured) {
     return Response.json(
@@ -105,8 +129,8 @@ export async function POST(request: Request) {
     );
   }
 
-  const durableMemory = await loadDurableMemory(messages);
-  const durableImage = await readDurableImage();
+  const durableMemory = await loadDurableMemory(messages, session);
+  const durableImage = await readDurableImage({ tenantId: session.tenantId, userId: session.userId });
   const agent = createMateoAgent(runtime.config, durableMemory.text);
   const conversation = messages.map(
     ({ role, content }): ModelMessage => ({ role, content: content.trim() }),

@@ -1,11 +1,14 @@
 import { loadEnvConfig } from "@next/env";
-import { closeMemoryGraph } from "../lib/memory/graph/client";
+import { closeMemoryGraph, writeGraph } from "../lib/memory/graph/client";
 import { inspectMemoryGraph } from "../lib/memory/graph/config";
 import { deleteOwnerData, listMemories, saveMemory } from "../lib/memory/graph/repository";
 import { SAMPLE_MEMORIES } from "../lib/memory/graph/sample";
-import { MATEO_OWNER_ID, USER_OWNER_ID } from "../lib/memory/graph/types";
+import { LEGACY_TENANT_ID, MATEO_OWNER_ID, USER_OWNER_ID, seedMemoryId } from "../lib/memory/graph/types";
 
 loadEnvConfig(process.cwd());
+
+// The fictional seed lives in the demo tenant, which is what public demo visitors read.
+const TENANT = LEGACY_TENANT_ID;
 
 async function main() {
   const status = inspectMemoryGraph();
@@ -18,7 +21,7 @@ async function main() {
   }
 
   const reset = process.argv.includes("--reset");
-  const existing = await listMemories({ limit: 1 });
+  const existing = await listMemories({ tenantId: TENANT, ownerIds: [USER_OWNER_ID, MATEO_OWNER_ID] }, { limit: 1 });
 
   if (existing.length > 0 && !reset) {
     console.log("The graph already has memories. Nothing was changed.");
@@ -27,15 +30,27 @@ async function main() {
   }
 
   if (reset) {
-    await deleteOwnerData(USER_OWNER_ID);
-    await deleteOwnerData(MATEO_OWNER_ID);
+    await deleteOwnerData({ tenantId: TENANT, ownerId: USER_OWNER_ID });
+    await deleteOwnerData({ tenantId: TENANT, ownerId: MATEO_OWNER_ID });
     console.log("Removed existing memories for Leo and Mateo.");
   }
 
+  // Reconcile any legacy Leo/Mateo Person created before tenants existed (null tenantId) into the
+  // demo tenant, so saveMemory's MERGE (p:Person {id, tenantId}) matches it instead of creating a
+  // second Person. Seed-only — the running app never writes these owner ids.
+  await writeGraph((tx) =>
+    tx.run("MATCH (p:Person) WHERE p.id IN $ids AND p.tenantId IS NULL SET p.tenantId = $tenant", {
+      ids: [USER_OWNER_ID, MATEO_OWNER_ID],
+      tenant: TENANT,
+    }),
+  );
+
   let entities = 0;
-  for (const sample of SAMPLE_MEMORIES) {
+  for (const [index, sample] of SAMPLE_MEMORIES.entries()) {
     const result = await saveMemory({
+      tenantId: TENANT,
       ownerId: sample.ownerId,
+      id: seedMemoryId(sample.ownerId, index),
       text: sample.text,
       eventDate: sample.eventDate,
       extraction: { entities: sample.entities, relations: sample.relations ?? [] },

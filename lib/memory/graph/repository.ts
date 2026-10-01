@@ -5,11 +5,11 @@ import { neo4j, readGraph, writeGraph } from "./client";
 import { extractMemoryGraph, normalizeExtraction, parseEventDate } from "./extract";
 import { buildFulltextQuery } from "./recall";
 import {
+  LEGACY_TENANT_ID,
   MAX_MEMORY_LENGTH,
   MemoryInputError,
   OWNER_NAMES,
-  READABLE_OWNER_IDS,
-  USER_OWNER_ID,
+  SEED_ID_PREFIX,
   sourceForOwner,
   type EntityKind,
   type Extraction,
@@ -18,11 +18,30 @@ import {
   type GraphNode,
   type MemoryGraphData,
   type MemoryRecord,
+  type ReadScope,
   type RecalledMemory,
+  type WriteScope,
 } from "./types";
 
 const NOT_SUPERSEDED = "NOT EXISTS { (:Memory)-[:SUPERSEDES]->(%) }";
 const current = (alias: string) => NOT_SUPERSEDED.replace("%", alias);
+
+// Every read is confined to one tenant. A memory tagged with the tenant always matches. Rows
+// created before tenants existed carry no tenantId; of those, ONLY the curated fictional seed
+// (ids beginning with SEED_ID_PREFIX) stays readable, and only in the demo tenant — so anything a
+// past public-demo visitor typed under the shared owner is no longer exposed to every visitor.
+// Params $legacyTenant and $seedPrefix must be supplied wherever this is used.
+const tenant = (alias: string) =>
+  `(${alias}.tenantId = $tenantId OR ` +
+  `(${alias}.tenantId IS NULL AND $tenantId = $legacyTenant AND ${alias}.id STARTS WITH $seedPrefix))`;
+
+// Params the memory tenant filter above needs, spread into each query.
+const TENANT_PARAMS = { legacyTenant: LEGACY_TENANT_ID, seedPrefix: SEED_ID_PREFIX };
+
+// Person cleanup (seed/test only) still treats a null tenantId as the legacy tenant, so a reseed
+// can remove or re-tag legacy Person nodes. A Person has no seed-prefixed id, so the stricter
+// memory rule does not apply to it.
+const personTenant = (alias: string) => `coalesce(${alias}.tenantId, '${LEGACY_TENANT_ID}') = $tenantId`;
 
 function toMemory(node: Node, ownerId: string): MemoryRecord {
   const p = node.properties as Record<string, unknown>;
@@ -76,7 +95,12 @@ async function linkExtraction(tx: ManagedTransaction, memoryId: string, extracti
 }
 
 export type SaveMemoryInput = {
-  ownerId?: string;
+  /** The tenant the memory belongs to. Always set from the caller's session, never the request body. */
+  tenantId: string;
+  /** Whose memory this is. Always set from the caller's session, never the request body. */
+  ownerId: string;
+  /** Seed-only: a deterministic id so the curated seed has stable, prefix-matchable ids. Defaults to a random UUID. */
+  id?: string;
   text: string;
   eventDate?: string;
   /** Id of the current version this memory replaces. The old version is kept, never edited. */
@@ -101,7 +125,7 @@ export type SaveMemoryResult = {
  * The source is derived from the owner, so nothing model-generated can be saved as a memory.
  */
 export async function saveMemory(input: SaveMemoryInput): Promise<SaveMemoryResult> {
-  const ownerId = input.ownerId ?? USER_OWNER_ID;
+  const { tenantId, ownerId } = input;
   const text = input.text.trim();
 
   if (!text) throw new MemoryInputError("Memory text cannot be empty.");
@@ -115,14 +139,14 @@ export async function saveMemory(input: SaveMemoryInput): Promise<SaveMemoryResu
     if (!eventDate) throw new MemoryInputError("The event date must look like 2023, 2023-03 or 2023-03-14.");
   }
 
-  const id = randomUUID();
+  const id = input.id ?? randomUUID();
   const source = sourceForOwner(ownerId);
 
   const created = await writeGraph(async (tx) => {
     const result = await tx.run(
-      `MERGE (p:Person {id: $ownerId}) ON CREATE SET p.name = $ownerName
+      `MERGE (p:Person {id: $ownerId, tenantId: $tenantId}) ON CREATE SET p.name = $ownerName
        CREATE (m:Memory {id: $id, text: $text, source: $source, createdAt: $createdAt,
-                         consent: 'granted', extraction: 'pending'})
+                         consent: 'granted', extraction: 'pending', tenantId: $tenantId})
        CREATE (p)-[:SHARED]->(m)
        SET m.eventDate = $eventDate
        WITH p, m
@@ -131,6 +155,7 @@ export async function saveMemory(input: SaveMemoryInput): Promise<SaveMemoryResu
        FOREACH (_ IN CASE WHEN old IS NULL THEN [] ELSE [1] END | CREATE (m)-[:SUPERSEDES]->(old))
        RETURN m, old IS NOT NULL AS replaced`,
       {
+        tenantId,
         ownerId,
         ownerName: OWNER_NAMES[ownerId] ?? ownerId,
         id,
@@ -172,17 +197,18 @@ export async function saveMemory(input: SaveMemoryInput): Promise<SaveMemoryResu
   return { memory, entities: extraction.entities.length, relations: extraction.relations.length };
 }
 
-export async function listMemories(options: { ownerIds?: string[]; limit?: number } = {}): Promise<MemoryRecord[]> {
-  const { ownerIds = READABLE_OWNER_IDS, limit = 100 } = options;
+export async function listMemories(scope: ReadScope, options: { limit?: number } = {}): Promise<MemoryRecord[]> {
+  const { tenantId, ownerIds } = scope;
+  const { limit = 100 } = options;
 
   return readGraph(async (tx) => {
     const result = await tx.run(
       `MATCH (p:Person)-[:SHARED]->(m:Memory)
-       WHERE p.id IN $ownerIds AND ${current("m")}
+       WHERE p.id IN $ownerIds AND ${tenant("m")} AND ${current("m")}
        RETURN m, p.id AS ownerId
        ORDER BY m.createdAt DESC
        LIMIT $limit`,
-      { ownerIds, limit: neo4j.int(limit) },
+      { tenantId, ownerIds, limit: neo4j.int(limit), ...TENANT_PARAMS },
     );
     return result.records.map((record) => toMemory(record.get("m"), record.get("ownerId")));
   });
@@ -195,9 +221,11 @@ export async function listMemories(options: { ownerIds?: string[]; limit?: numbe
  */
 export async function recallMemories(
   query: string,
-  options: { ownerIds?: string[]; limit?: number; relatedLimit?: number; recentLimit?: number } = {},
+  scope: ReadScope,
+  options: { limit?: number; relatedLimit?: number; recentLimit?: number } = {},
 ): Promise<RecalledMemory[]> {
-  const { ownerIds = READABLE_OWNER_IDS, limit = 4, relatedLimit = 3, recentLimit = 3 } = options;
+  const { tenantId, ownerIds } = scope;
+  const { limit = 4, relatedLimit = 3, recentLimit = 3 } = options;
   const fulltext = buildFulltextQuery(query);
 
   if (fulltext) {
@@ -205,14 +233,14 @@ export async function recallMemories(
       const result = await tx.run(
         `CALL db.index.fulltext.queryNodes('memory_text', $query, {limit: $fetch}) YIELD node AS m, score
          MATCH (p:Person)-[:SHARED]->(m)
-         WHERE p.id IN $ownerIds AND ${current("m")}
+         WHERE p.id IN $ownerIds AND ${tenant("m")} AND ${current("m")}
          WITH m, p, score ORDER BY score DESC LIMIT $limit
          OPTIONAL MATCH (m)-[:MENTIONS]->(e:Entity)<-[:MENTIONS]-(r:Memory)<-[:SHARED]-(rp:Person)
-         WHERE r <> m AND rp.id IN $ownerIds AND ${current("r")}
+         WHERE r <> m AND rp.id IN $ownerIds AND ${tenant("r")} AND ${current("r")}
          WITH m, p, score, r, rp, collect(DISTINCT e.name) AS via
          RETURN m, p.id AS ownerId, score, r, rp.id AS relatedOwnerId, via
          ORDER BY score DESC`,
-        { query: fulltext, ownerIds, fetch: neo4j.int(limit * 3), limit: neo4j.int(limit) },
+        { query: fulltext, tenantId, ownerIds, fetch: neo4j.int(limit * 3), limit: neo4j.int(limit), ...TENANT_PARAMS },
       );
 
       const matches = new Map<string, RecalledMemory>();
@@ -242,7 +270,7 @@ export async function recallMemories(
     if (recalled.length > 0) return recalled;
   }
 
-  const recent = await listMemories({ ownerIds, limit: recentLimit });
+  const recent = await listMemories(scope, { limit: recentLimit });
   return recent.map((memory) => ({ ...memory, reason: "recent" as const }));
 }
 
@@ -253,39 +281,39 @@ const ASK_CONTEXT_ALL = 12;
  * oldest first, so questions like "what do these have in common?" work. Once it outgrows
  * that, fall back to recall so the context stays relevant.
  */
-export async function memoriesForQuestion(question: string): Promise<MemoryRecord[]> {
-  const everything = await listMemories({ limit: ASK_CONTEXT_ALL + 1 });
+export async function memoriesForQuestion(question: string, scope: ReadScope): Promise<MemoryRecord[]> {
+  const everything = await listMemories(scope, { limit: ASK_CONTEXT_ALL + 1 });
 
   if (everything.length <= ASK_CONTEXT_ALL) {
     return everything.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
-  return recallMemories(question, { limit: 6, relatedLimit: 4 });
+  return recallMemories(question, scope, { limit: 6, relatedLimit: 4 });
 }
 
-export async function getMemoryGraph(options: { ownerIds?: string[] } = {}): Promise<MemoryGraphData> {
-  const { ownerIds = READABLE_OWNER_IDS } = options;
+export async function getMemoryGraph(scope: ReadScope): Promise<MemoryGraphData> {
+  const { tenantId, ownerIds } = scope;
 
   return readGraph(async (tx) => {
     const memoryRows = await tx.run(
       `MATCH (p:Person)-[:SHARED]->(m:Memory)
-       WHERE p.id IN $ownerIds AND ${current("m")}
+       WHERE p.id IN $ownerIds AND ${tenant("m")} AND ${current("m")}
        RETURN m, p.id AS ownerId
        ORDER BY m.createdAt`,
-      { ownerIds },
+      { tenantId, ownerIds, ...TENANT_PARAMS },
     );
     const mentionRows = await tx.run(
       `MATCH (p:Person)-[:SHARED]->(m:Memory)-[r:MENTIONS]->(e:Entity)
-       WHERE p.id IN $ownerIds AND ${current("m")}
+       WHERE p.id IN $ownerIds AND ${tenant("m")} AND ${current("m")}
        RETURN m.id AS memoryId, e, r.extractor AS extractor`,
-      { ownerIds },
+      { tenantId, ownerIds, ...TENANT_PARAMS },
     );
     const relationRows = await tx.run(
       `MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
        MATCH (p:Person)-[:SHARED]->(m:Memory {id: r.memoryId})
-       WHERE p.id IN $ownerIds AND ${current("m")}
+       WHERE p.id IN $ownerIds AND ${tenant("m")} AND ${current("m")}
        RETURN a.key AS source, b.key AS target, r.label AS label, r.memoryId AS memoryId, r.extractor AS extractor`,
-      { ownerIds },
+      { tenantId, ownerIds, ...TENANT_PARAMS },
     );
 
     const nodes: GraphNode[] = memoryRows.records.map((record) => ({
@@ -342,18 +370,19 @@ export async function getMemoryGraph(options: { ownerIds?: string[] } = {}): Pro
  * Erase a memory, every earlier version of it, and any entity nothing else mentions.
  * Only the latest version can be targeted; returns false if it does not exist.
  */
-export async function deleteMemory(ownerId: string, memoryId: string): Promise<boolean> {
+export async function deleteMemory(scope: WriteScope, memoryId: string): Promise<boolean> {
+  const { tenantId, ownerId } = scope;
   return writeGraph(async (tx) => {
     const found = await tx.run(
-      `MATCH (:Person {id: $ownerId})-[:SHARED]->(m:Memory {id: $memoryId})
-       WHERE ${current("m")}
+      `MATCH (:Person {id: $ownerId, tenantId: $tenantId})-[:SHARED]->(m:Memory {id: $memoryId})
+       WHERE ${tenant("m")} AND ${current("m")}
        OPTIONAL MATCH (m)-[:SUPERSEDES*1..]->(old:Memory)
        RETURN m.id AS id, [x IN collect(DISTINCT old) | x.id] AS olds`,
-      { ownerId, memoryId },
+      { tenantId, ownerId, memoryId, ...TENANT_PARAMS },
     );
 
     // Grouping by m.id matters: an aggregate with no grouping key returns one row even
-    // when nothing matched, which would let any id (another owner's included) through.
+    // when nothing matched, which would let any id (another tenant's or owner's) through.
     if (found.records.length === 0) return false;
 
     const ids = [memoryId, ...(found.records[0].get("olds") as string[])];
@@ -364,18 +393,24 @@ export async function deleteMemory(ownerId: string, memoryId: string): Promise<b
   });
 }
 
-/** Remove everything an owner has stored. Used by the seed script and by tests. */
-export async function deleteOwnerData(ownerId: string): Promise<void> {
+/**
+ * Remove everything an owner has stored in a tenant. Used by the seed script and by tests.
+ * Legacy rows with no tenantId count as the legacy tenant so a re-seed can clean them up.
+ */
+export async function deleteOwnerData(scope: WriteScope): Promise<void> {
+  const { tenantId, ownerId } = scope;
   await writeGraph(async (tx) => {
     const result = await tx.run(
-      "MATCH (:Person {id: $ownerId})-[:SHARED]->(m:Memory) RETURN collect(m.id) AS ids",
-      { ownerId },
+      `MATCH (p:Person)-[:SHARED]->(m:Memory)
+       WHERE p.id = $ownerId AND ${personTenant("p")}
+       RETURN collect(m.id) AS ids`,
+      { tenantId, ownerId },
     );
     const ids = (result.records[0]?.get("ids") ?? []) as string[];
 
     await tx.run("MATCH ()-[r:RELATED_TO]->() WHERE r.memoryId IN $ids DELETE r", { ids });
     await tx.run("MATCH (m:Memory) WHERE m.id IN $ids DETACH DELETE m", { ids });
-    await tx.run("MATCH (p:Person {id: $ownerId}) DETACH DELETE p", { ownerId });
+    await tx.run(`MATCH (p:Person) WHERE p.id = $ownerId AND ${personTenant("p")} DETACH DELETE p`, { tenantId, ownerId });
     await removeOrphanEntities(tx);
   });
 }

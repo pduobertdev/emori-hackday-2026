@@ -1,3 +1,5 @@
+import { RATE_LIMITS, enforceIpAndUserLimit } from "@/lib/auth/rate-limit";
+import { requireSession } from "@/lib/auth/session";
 import { writeDurableImage } from "@/lib/memory/store";
 
 export const runtime = "nodejs";
@@ -5,7 +7,19 @@ export const runtime = "nodejs";
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
 export async function POST(request: Request) {
-  const formData = await request.formData();
+  const session = requireSession(request);
+  if (session instanceof Response) return session;
+
+  // Per IP and per user, before buffering up to 10 MB, so one visitor can't flood storage.
+  const limited = enforceIpAndUserLimit("model", session.userId, request, RATE_LIMITS.modelIp(), RATE_LIMITS.model());
+  if (limited) return limited;
+
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return Response.json({ error: "Send the image as multipart/form-data." }, { status: 400 });
+  }
   const image = formData.get("image");
 
   if (!(image instanceof File)) {
@@ -20,7 +34,11 @@ export async function POST(request: Request) {
     return Response.json({ error: "The JPEG must be between 1 byte and 10 MB." }, { status: 400 });
   }
 
-  await writeDurableImage(new Uint8Array(await image.arrayBuffer()));
+  // Stored per tenant and user, so one visitor's reference image is never shown to another.
+  await writeDurableImage(
+    { tenantId: session.tenantId, userId: session.userId },
+    new Uint8Array(await image.arrayBuffer()),
+  );
 
-  return Response.json({ saved: true, filename: "memorysample-image.jpg" });
+  return Response.json({ saved: true });
 }

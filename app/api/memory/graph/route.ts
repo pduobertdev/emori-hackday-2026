@@ -1,11 +1,16 @@
 import { inspectAgentRuntime } from "@/lib/agent/config";
+import { requireSession } from "@/lib/auth/session";
+import { memoryBackend } from "@/lib/memory/graph/backend";
 import { describeMemoryGraphConnection, inspectMemoryGraph } from "@/lib/memory/graph/config";
 import { NO_STORE, memoryGraphErrorResponse } from "@/lib/memory/graph/http";
-import { getMemoryGraph } from "@/lib/memory/graph/repository";
+import { readScopeFor } from "@/lib/memory/graph/scope";
 
 export const runtime = "nodejs";
 
-export async function GET() {
+export async function GET(request: Request) {
+  const session = requireSession(request);
+  if (session instanceof Response) return session;
+
   const status = inspectMemoryGraph();
 
   if (!status.configured) {
@@ -16,7 +21,7 @@ export async function GET() {
   const agent = inspectAgentRuntime();
 
   try {
-    const graph = await getMemoryGraph();
+    const graph = await memoryBackend().getMemoryGraph(readScopeFor(session));
     const connection = describeMemoryGraphConnection(status.config.uri);
 
     return Response.json(
