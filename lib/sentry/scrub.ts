@@ -6,9 +6,9 @@
 // - Values under sensitive keys (email, email_hash, token, password, cookie, authorization,
 //   secret, api key, signature...) become "[Filtered]".
 // - Cookies are dropped. Authorization / Cookie / CSRF / signature headers are filtered.
-// - Request bodies are dropped ENTIRELY on auth routes (login, register, password, oauth,
-//   sanctum/token), billing routes (stripe, webhook, checkout, subscription) and the app's
-//   personal-content routes (memory, chat, voice).
+// - Request bodies are dropped ENTIRELY on every route. The query string is dropped too on auth
+//   routes (login, register, password, oauth, sanctum/token), billing routes (stripe, webhook,
+//   checkout, subscription) and the app's personal-content routes (memory, chat, voice).
 // - Bearer tokens, JWTs, provider API keys (sk-, sk_live_, whsec_...) and `token=...`
 //   pairs in free text are redacted.
 // - IP-bearing headers (x-forwarded-for, x-real-ip, forwarded, cf-connecting-ip...) are filtered
@@ -123,14 +123,14 @@ export function scrubRequest(request: SentryRequest): SentryRequest {
   const out: SentryRequest = { ...request };
   delete out.cookies;
 
+  // Request bodies never leave the server, on ANY route.
+  delete out.data;
+
   if (typeof out.url === "string" && isSensitivePath(pathOf(out.url))) {
-    // Drop body AND query string on auth/billing/personal-content routes.
-    delete out.data;
+    // Also drop the query string on auth/billing/personal-content routes.
     delete out.query_string;
     const q = out.url.indexOf("?");
     if (q !== -1) out.url = out.url.slice(0, q);
-  } else if (out.data !== undefined) {
-    out.data = scrubValue(out.data);
   }
 
   if (out.headers) out.headers = scrubValue(out.headers) as SentryRequest["headers"];

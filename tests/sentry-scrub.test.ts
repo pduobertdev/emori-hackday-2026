@@ -102,12 +102,16 @@ for (const path of sensitive) {
   });
 }
 
-test("request body kept but scrubbed on ordinary routes", () => {
+test("request body dropped on ordinary routes too", () => {
   assert.equal(isSensitivePath("/api/author-settings"), false);
-  const event = scrubEvent({
-    request: { url: "https://emori.example/api/other", data: { title: "with sam@example.com", email: "sam@example.com", n: 1 } },
-  } as Event);
-  assert.deepEqual(event.request?.data, { title: `with ${EMAIL_PLACEHOLDER}`, email: FILTERED, n: 1 });
+  for (const data of [{ title: "with sam@example.com", email: "sam@example.com", n: 1 }, '{"memory":"private"}']) {
+    const event = scrubEvent({
+      request: { url: "https://emori.example/api/other?page=2", method: "POST", data },
+    } as Event);
+    assert.equal(event.request?.data, undefined);
+    assert.equal(event.request?.method, "POST");
+    assert.equal(event.request?.url, "https://emori.example/api/other?page=2");
+  }
 });
 
 test("URL tokens and query params are scrubbed", () => {
