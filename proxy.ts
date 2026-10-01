@@ -26,9 +26,11 @@ export function proxy(request: NextRequest) {
 
   if (verifySession(request.cookies.get(COOKIE_NAME)?.value, { secret })) return NextResponse.next();
 
-  // Only the mint path is rate-limited (shared budget with POST /api/session/demo): a visitor with
-  // a valid cookie returned above, so a normal user mints once per TTL, while a script that discards
-  // cookies and re-mints on every load is throttled per IP.
+  // Only the mint path is rate-limited: a visitor with a valid cookie returned above, so a normal
+  // user mints once per TTL, while a script that discards cookies and re-mints on every load is
+  // throttled per IP. This uses the same key NAME as POST /api/session/demo (`demo-mint:<ip>`) but
+  // NOT the same counter: the proxy and the route run as separate functions/instances, each with its
+  // own in-memory Map, so the two budgets are independent — not a shared cap.
   const limited = checkRateLimit(`demo-mint:${clientIp(request)}`, RATE_LIMITS.demoMint());
   if (!limited.ok) {
     const blocked = NextResponse.json(

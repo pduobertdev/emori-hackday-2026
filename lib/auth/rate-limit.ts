@@ -13,14 +13,26 @@ type Bucket = { count: number; resetAt: number };
 const buckets = new Map<string, Bucket>();
 let lastPrune = 0;
 const PRUNE_INTERVAL_MS = 60_000;
+/**
+ * Hard ceiling on distinct live keys. Expired buckets are pruned lazily every 60s, but keys created
+ * within a window accumulate until then, so cap the Map to bound memory. When it is full of live
+ * buckets we fail closed (reject new keys with 429): cheaper to turn away a new caller than to let
+ * the Map — and the paid model/voice calls it guards — grow without bound.
+ */
+const MAX_BUCKETS = 10_000;
+
+/** Delete every expired bucket right now. */
+function pruneExpired(now: number): void {
+  for (const [key, bucket] of buckets) {
+    if (bucket.resetAt <= now) buckets.delete(key);
+  }
+  lastPrune = now;
+}
 
 /** Drop expired buckets occasionally so the Map cannot grow without bound. */
 function prune(now: number): void {
   if (now - lastPrune < PRUNE_INTERVAL_MS) return;
-  lastPrune = now;
-  for (const [key, bucket] of buckets) {
-    if (bucket.resetAt <= now) buckets.delete(key);
-  }
+  pruneExpired(now);
 }
 
 export type RateLimitResult = { ok: true } | { ok: false; retryAfterSeconds: number };
@@ -29,32 +41,53 @@ export function checkRateLimit(key: string, rule: RateLimitRule, now: number = D
   prune(now);
 
   const existing = buckets.get(key);
-  if (!existing || existing.resetAt <= now) {
-    buckets.set(key, { count: 1, resetAt: now + rule.windowSeconds * 1000 });
+  if (existing && existing.resetAt > now) {
+    if (existing.count >= rule.limit) {
+      return { ok: false, retryAfterSeconds: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)) };
+    }
+    existing.count += 1;
     return { ok: true };
   }
 
-  if (existing.count >= rule.limit) {
-    return { ok: false, retryAfterSeconds: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)) };
+  // Brand-new key (an expired `existing` is replaced in place and does not grow the Map). Guard the
+  // cap first: prune expired buckets, and if the Map is still full of live ones, fail closed.
+  if (!existing && buckets.size >= MAX_BUCKETS) {
+    pruneExpired(now);
+    if (buckets.size >= MAX_BUCKETS) return { ok: false, retryAfterSeconds: rule.windowSeconds };
   }
 
-  existing.count += 1;
+  buckets.set(key, { count: 1, resetAt: now + rule.windowSeconds * 1000 });
   return { ok: true };
 }
 
 /**
- * The caller's IP: the first hop in `x-forwarded-for`, else `x-real-ip`, else "unknown". The
- * fallback means a proxy that strips these headers rate-limits every such caller as one bucket —
- * safe (over-limits), never under-limits.
+ * The caller's IP, used only as a rate-limit bucket key.
+ *
+ * TRUST ASSUMPTION: this app is deployed behind Vercel. Vercel sets `x-vercel-forwarded-for` and
+ * `x-real-ip` from the real connecting socket and overwrites any client-supplied copies, so those
+ * are trustworthy. (`NextRequest.ip` was removed in this Next version, so we read headers.)
+ *
+ * We never trust the FIRST `x-forwarded-for` hop: a client can send any `X-Forwarded-For`, and a
+ * proxy APPENDS the real IP after it, so the first token stays attacker-controlled — rotating it
+ * would mint unlimited buckets and bypass every limit. If we must fall back to raw XFF we take the
+ * LAST hop (the one our nearest proxy added).
+ *
+ * Order: x-vercel-forwarded-for, x-real-ip, last x-forwarded-for hop, "unknown". The "unknown"
+ * fallback buckets all such callers together — safe (over-limits), never under-limits.
  */
 export function clientIp(request: { headers: { get(name: string): string | null } }): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) {
-    const first = forwarded.split(",")[0]?.trim();
-    if (first) return first;
-  }
+  const vercel = request.headers.get("x-vercel-forwarded-for")?.trim();
+  if (vercel) return vercel;
+
   const real = request.headers.get("x-real-ip")?.trim();
   if (real) return real;
+
+  const forwarded = request.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const hops = forwarded.split(",");
+    const last = hops[hops.length - 1]?.trim();
+    if (last) return last;
+  }
   return "unknown";
 }
 

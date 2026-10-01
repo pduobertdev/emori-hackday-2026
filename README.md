@@ -36,10 +36,12 @@ the AuraDB demo working with no migration, such a row is still readable — but 
 is `demo` **and** its id begins with the curated-seed prefix `seed-` (the ids the seed script
 writes). That keeps the hand-authored Leo/Mateo seed visible while hiding anything a past public
 visitor may have typed under the shared `leo` owner, which would otherwise have been exposed to
-every visitor. Everything written from now on is tenant-tagged explicitly. Deployers should run
-`npm run memory:seed -- --reset` against Aura once so the seed is re-created with stable `seed-…`
-ids and an explicit `demo` `tenantId`; the seed script also reconciles any legacy `leo`/`mateo`
-`Person` into the demo tenant so a non-reset run can't leave a duplicate.
+every visitor. Everything written from now on is tenant-tagged explicitly.
+
+> **REQUIRED on every deploy.** Immediately after deploying, run `npm run memory:seed -- --reset`
+> against Aura, or the public demo graph will be blank (old seed rows have random ids and no tenant;
+> they are hidden by design). `--reset` also purges legacy visitor-typed rows (fictional demo data)
+> and reconciles any legacy `leo`/`mateo` `Person` into the demo tenant so no duplicate is left.
 
 - **Demo (public, no login).** When `EMORI_DEMO_ACCESS=on`, a page load mints a fresh anonymous
   visitor session in the `demo` tenant (role `demo`, 12h) via `proxy.ts`; `POST /api/session/demo`
@@ -59,9 +61,10 @@ ids and an explicit `demo` `tenantId`; the seed script also reconciles any legac
 Model and voice routes accept demo sessions (that is the demo), so they are rate-limited to keep
 the free demo from draining the paid model/voice budget:
 
-- `POST /api/session/demo` and the `proxy.ts` auto-mint share a per-IP budget (default **10 per
-  10 min**). The mint returns the session **only** as the HttpOnly cookie — never in the JSON body,
-  so a token can't be scraped and replayed.
+- `POST /api/session/demo` and the `proxy.ts` auto-mint both apply a per-IP limit (default **10 per
+  10 min**) under the same key name — but counts are per-instance (see below), so the two are
+  independent budgets, not a single shared cap. The mint returns the session **only** as the
+  HttpOnly cookie — never in the JSON body, so a token can't be scraped and replayed.
 - `POST /api/chat` is limited per IP **and** per session `userId` (default **30 per min** each).
 - `POST /api/voice/transcribe` is limited per IP (default **10 per min**).
 
@@ -70,8 +73,17 @@ var in `limit:windowSeconds` form — `RATE_LIMIT_DEMO_MINT`, `RATE_LIMIT_CHAT`,
 
 **This limiter is per-instance best-effort.** It keeps counts in an in-memory `Map`, so on
 serverless (Vercel) every warm instance has its own counters and the effective cap is roughly the
-limit times the number of live instances. The follow-up for a hard global cap is a shared store —
-Vercel KV or Upstash Redis, both have a free tier — behind the same `checkRateLimit` call site.
+limit times the number of live instances. The Map is capped at 10k live keys; when full it fails
+closed (new callers get `429`) so it can't grow without bound. The follow-up for a hard global cap
+is a shared store — Vercel KV or Upstash Redis, both have a free tier — behind the same
+`checkRateLimit` call site.
+
+**IP trust assumption.** The per-IP key is derived from `x-vercel-forwarded-for` / `x-real-ip`
+(which Vercel sets from the real connection and the client cannot forge), falling back to the *last*
+`x-forwarded-for` hop. The *first* `x-forwarded-for` hop is deliberately ignored — it is
+client-controlled, so trusting it would let a caller mint a fresh bucket per request. This assumes
+deployment behind Vercel (or an equivalent proxy that sets those headers); self-hosting behind a
+different proxy may need the header choice in `clientIp` revisited.
 
 ## Agent runtime
 

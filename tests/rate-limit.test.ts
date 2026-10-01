@@ -43,11 +43,43 @@ test("keys are independent", () => {
   assert.equal(checkRateLimit("a", rule, now).ok, false);
 });
 
-test("clientIp prefers the first x-forwarded-for hop, then x-real-ip, then unknown", () => {
+test("clientIp uses platform headers and the LAST x-forwarded-for hop, never the spoofable first", () => {
   const h = (headers: Record<string, string>) => ({ headers: new Headers(headers) });
-  assert.equal(clientIp(h({ "x-forwarded-for": "1.2.3.4, 5.6.7.8" })), "1.2.3.4");
+  assert.equal(clientIp(h({ "x-vercel-forwarded-for": "11.11.11.11" })), "11.11.11.11");
   assert.equal(clientIp(h({ "x-real-ip": "9.9.9.9" })), "9.9.9.9");
+  // The proxy appends the real IP, so the last hop is the trustworthy one.
+  assert.equal(clientIp(h({ "x-forwarded-for": "6.6.6.6, 2.2.2.2" })), "2.2.2.2");
   assert.equal(clientIp(h({})), "unknown");
+  // Platform header wins over raw XFF even when both are present.
+  assert.equal(clientIp(h({ "x-real-ip": "9.9.9.9", "x-forwarded-for": "6.6.6.6, 2.2.2.2" })), "9.9.9.9");
+});
+
+test("a spoofed first x-forwarded-for hop cannot mint a fresh rate-limit bucket", () => {
+  const rule = { limit: 1, windowSeconds: 60 };
+  const now = 4_000_000;
+  // Same real (last) hop, attacker rotates only the first hop.
+  const req = (forgedFirst: string) => ({ headers: new Headers({ "x-forwarded-for": `${forgedFirst}, 2.2.2.2` }) });
+  assert.equal(checkRateLimit(`demo-mint:${clientIp(req("a.a.a.a"))}`, rule, now).ok, true);
+  assert.equal(
+    checkRateLimit(`demo-mint:${clientIp(req("b.b.b.b"))}`, rule, now).ok,
+    false,
+    "rotating the forged first hop maps to the same bucket and is blocked",
+  );
+});
+
+test("caps the bucket Map and fails closed for brand-new keys when it is full of live buckets", () => {
+  const rule = { limit: 5, windowSeconds: 60 };
+  const now = 5_000_000;
+  for (let i = 0; i < 10_000; i++) {
+    assert.equal(checkRateLimit(`cap-${i}`, rule, now).ok, true);
+  }
+  const overflow = checkRateLimit("cap-overflow", rule, now);
+  assert.equal(overflow.ok, false, "a new key is rejected while the Map is full");
+  if (!overflow.ok) assert.equal(overflow.retryAfterSeconds, rule.windowSeconds);
+  // An already-tracked key still counts (it does not grow the Map).
+  assert.equal(checkRateLimit("cap-0", rule, now).ok, true);
+  // Once live buckets expire, a new key is admitted again.
+  assert.equal(checkRateLimit("cap-overflow", rule, now + 61_000).ok, true);
 });
 
 test("env overrides the default rule when well-formed, and is ignored when not", () => {
