@@ -9,6 +9,7 @@ import {
   MAX_MEMORY_LENGTH,
   MemoryInputError,
   OWNER_NAMES,
+  SEED_ID_PREFIX,
   sourceForOwner,
   type EntityKind,
   type Extraction,
@@ -25,9 +26,22 @@ import {
 const NOT_SUPERSEDED = "NOT EXISTS { (:Memory)-[:SUPERSEDES]->(%) }";
 const current = (alias: string) => NOT_SUPERSEDED.replace("%", alias);
 
-// Every read is confined to one tenant. Rows created before tenants existed carry no tenantId
-// and are treated as the legacy tenant, so the live Aura data keeps working with no migration.
-const tenant = (alias: string) => `coalesce(${alias}.tenantId, '${LEGACY_TENANT_ID}') = $tenantId`;
+// Every read is confined to one tenant. A memory tagged with the tenant always matches. Rows
+// created before tenants existed carry no tenantId; of those, ONLY the curated fictional seed
+// (ids beginning with SEED_ID_PREFIX) stays readable, and only in the demo tenant — so anything a
+// past public-demo visitor typed under the shared owner is no longer exposed to every visitor.
+// Params $legacyTenant and $seedPrefix must be supplied wherever this is used.
+const tenant = (alias: string) =>
+  `(${alias}.tenantId = $tenantId OR ` +
+  `(${alias}.tenantId IS NULL AND $tenantId = $legacyTenant AND ${alias}.id STARTS WITH $seedPrefix))`;
+
+// Params the memory tenant filter above needs, spread into each query.
+const TENANT_PARAMS = { legacyTenant: LEGACY_TENANT_ID, seedPrefix: SEED_ID_PREFIX };
+
+// Person cleanup (seed/test only) still treats a null tenantId as the legacy tenant, so a reseed
+// can remove or re-tag legacy Person nodes. A Person has no seed-prefixed id, so the stricter
+// memory rule does not apply to it.
+const personTenant = (alias: string) => `coalesce(${alias}.tenantId, '${LEGACY_TENANT_ID}') = $tenantId`;
 
 function toMemory(node: Node, ownerId: string): MemoryRecord {
   const p = node.properties as Record<string, unknown>;
@@ -85,6 +99,8 @@ export type SaveMemoryInput = {
   tenantId: string;
   /** Whose memory this is. Always set from the caller's session, never the request body. */
   ownerId: string;
+  /** Seed-only: a deterministic id so the curated seed has stable, prefix-matchable ids. Defaults to a random UUID. */
+  id?: string;
   text: string;
   eventDate?: string;
   /** Id of the current version this memory replaces. The old version is kept, never edited. */
@@ -123,7 +139,7 @@ export async function saveMemory(input: SaveMemoryInput): Promise<SaveMemoryResu
     if (!eventDate) throw new MemoryInputError("The event date must look like 2023, 2023-03 or 2023-03-14.");
   }
 
-  const id = randomUUID();
+  const id = input.id ?? randomUUID();
   const source = sourceForOwner(ownerId);
 
   const created = await writeGraph(async (tx) => {
@@ -192,7 +208,7 @@ export async function listMemories(scope: ReadScope, options: { limit?: number }
        RETURN m, p.id AS ownerId
        ORDER BY m.createdAt DESC
        LIMIT $limit`,
-      { tenantId, ownerIds, limit: neo4j.int(limit) },
+      { tenantId, ownerIds, limit: neo4j.int(limit), ...TENANT_PARAMS },
     );
     return result.records.map((record) => toMemory(record.get("m"), record.get("ownerId")));
   });
@@ -224,7 +240,7 @@ export async function recallMemories(
          WITH m, p, score, r, rp, collect(DISTINCT e.name) AS via
          RETURN m, p.id AS ownerId, score, r, rp.id AS relatedOwnerId, via
          ORDER BY score DESC`,
-        { query: fulltext, tenantId, ownerIds, fetch: neo4j.int(limit * 3), limit: neo4j.int(limit) },
+        { query: fulltext, tenantId, ownerIds, fetch: neo4j.int(limit * 3), limit: neo4j.int(limit), ...TENANT_PARAMS },
       );
 
       const matches = new Map<string, RecalledMemory>();
@@ -284,20 +300,20 @@ export async function getMemoryGraph(scope: ReadScope): Promise<MemoryGraphData>
        WHERE p.id IN $ownerIds AND ${tenant("m")} AND ${current("m")}
        RETURN m, p.id AS ownerId
        ORDER BY m.createdAt`,
-      { tenantId, ownerIds },
+      { tenantId, ownerIds, ...TENANT_PARAMS },
     );
     const mentionRows = await tx.run(
       `MATCH (p:Person)-[:SHARED]->(m:Memory)-[r:MENTIONS]->(e:Entity)
        WHERE p.id IN $ownerIds AND ${tenant("m")} AND ${current("m")}
        RETURN m.id AS memoryId, e, r.extractor AS extractor`,
-      { tenantId, ownerIds },
+      { tenantId, ownerIds, ...TENANT_PARAMS },
     );
     const relationRows = await tx.run(
       `MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
        MATCH (p:Person)-[:SHARED]->(m:Memory {id: r.memoryId})
        WHERE p.id IN $ownerIds AND ${tenant("m")} AND ${current("m")}
        RETURN a.key AS source, b.key AS target, r.label AS label, r.memoryId AS memoryId, r.extractor AS extractor`,
-      { tenantId, ownerIds },
+      { tenantId, ownerIds, ...TENANT_PARAMS },
     );
 
     const nodes: GraphNode[] = memoryRows.records.map((record) => ({
@@ -362,7 +378,7 @@ export async function deleteMemory(scope: WriteScope, memoryId: string): Promise
        WHERE ${tenant("m")} AND ${current("m")}
        OPTIONAL MATCH (m)-[:SUPERSEDES*1..]->(old:Memory)
        RETURN m.id AS id, [x IN collect(DISTINCT old) | x.id] AS olds`,
-      { tenantId, ownerId, memoryId },
+      { tenantId, ownerId, memoryId, ...TENANT_PARAMS },
     );
 
     // Grouping by m.id matters: an aggregate with no grouping key returns one row even
@@ -386,7 +402,7 @@ export async function deleteOwnerData(scope: WriteScope): Promise<void> {
   await writeGraph(async (tx) => {
     const result = await tx.run(
       `MATCH (p:Person)-[:SHARED]->(m:Memory)
-       WHERE p.id = $ownerId AND ${tenant("p")}
+       WHERE p.id = $ownerId AND ${personTenant("p")}
        RETURN collect(m.id) AS ids`,
       { tenantId, ownerId },
     );
@@ -394,7 +410,7 @@ export async function deleteOwnerData(scope: WriteScope): Promise<void> {
 
     await tx.run("MATCH ()-[r:RELATED_TO]->() WHERE r.memoryId IN $ids DELETE r", { ids });
     await tx.run("MATCH (m:Memory) WHERE m.id IN $ids DETACH DELETE m", { ids });
-    await tx.run(`MATCH (p:Person) WHERE p.id = $ownerId AND ${tenant("p")} DETACH DELETE p`, { tenantId, ownerId });
+    await tx.run(`MATCH (p:Person) WHERE p.id = $ownerId AND ${personTenant("p")} DETACH DELETE p`, { tenantId, ownerId });
     await removeOrphanEntities(tx);
   });
 }

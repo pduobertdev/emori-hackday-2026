@@ -21,6 +21,19 @@ export const MAX_MEMORY_LENGTH = 50_000;
 /** The tenant a row created before tenants existed belongs to. Keeps live Aura data readable. */
 export const LEGACY_TENANT_ID = "demo";
 
+/**
+ * Deterministic prefix for the curated fictional seed (set by the seed script). It is the ONLY
+ * legacy content (rows with no tenantId) that stays readable: a legacy row is visible only when it
+ * is in the demo tenant AND its id begins with this prefix. That keeps the hand-authored Leo/Mateo
+ * seed visible while hiding anything a past public-demo visitor typed under the shared "leo" owner.
+ */
+export const SEED_ID_PREFIX = "seed-";
+
+/** The stable id of a seed memory: `seed-<ownerId>-<index>`. */
+export function seedMemoryId(ownerId: string, index: number): string {
+  return `${SEED_ID_PREFIX}${ownerId}-${index}`;
+}
+
 /** Scope for reads: one tenant, a set of owners the caller may see. */
 export type ReadScope = { tenantId: string; ownerIds: string[] };
 /** Scope for writes and deletes: always exactly the caller's own tenant and owner. */

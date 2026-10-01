@@ -11,6 +11,7 @@ import { POST as proposePost } from "../app/api/memory/propose/route";
 import { POST as imagePost } from "../app/api/memory/image/route";
 import { POST as demoSession } from "../app/api/session/demo/route";
 import { POST as voicePost } from "../app/api/voice/transcribe/route";
+import { __resetRateLimitsForTests } from "../lib/auth/rate-limit";
 import { createSession, signSession, verifySession, type Role } from "../lib/auth/session";
 import {
   resetMemoryBackendForTests,
@@ -147,11 +148,15 @@ after(async () => {
 
 beforeEach(() => {
   applyConfigEnv();
+  __resetRateLimitsForTests();
   setMemoryBackendForTests(makeFakeBackend().backend);
 });
 
 afterEach(() => {
   resetMemoryBackendForTests();
+  delete process.env.RATE_LIMIT_CHAT;
+  delete process.env.RATE_LIMIT_VOICE;
+  delete process.env.RATE_LIMIT_DEMO_MINT;
 });
 
 // Every protected route, exercised with no token and with a tampered token, with all
@@ -259,21 +264,77 @@ test("within the demo tenant, one visitor cannot see or delete another visitor's
   assert.ok(rows.some((row) => row.id === "m1"), "visitor one's memory still exists");
 });
 
+const mintRequest = () => new Request("http://localhost/api/session/demo", { method: "POST" });
+
 test("the demo session route is gated by EMORI_DEMO_ACCESS", async () => {
   delete process.env.EMORI_DEMO_ACCESS;
-  assert.equal((await demoSession()).status, 404, "off by default");
+  assert.equal((await demoSession(mintRequest())).status, 404, "off by default");
 
   process.env.EMORI_DEMO_ACCESS = "on";
-  const response = await demoSession();
+  const response = await demoSession(mintRequest());
   assert.equal(response.status, 200);
 
   const setCookie = response.headers.get("set-cookie") ?? "";
   assert.match(setCookie, /emori_session=/);
   assert.match(setCookie, /HttpOnly/);
 
-  const body = (await response.json()) as { token: string; tenantId: string; role: string };
+  // The token is delivered only in the HttpOnly cookie, never the JSON body.
+  const body = (await response.json()) as Record<string, unknown>;
   assert.equal(body.tenantId, "demo");
-  const session = verifySession(body.token, { secret: SECRET });
+  assert.ok(!("token" in body), "the raw token is not returned in the body");
+
+  const token = setCookie.match(/emori_session=([^;]+)/)?.[1] ?? "";
+  const session = verifySession(token, { secret: SECRET });
   assert.equal(session?.role, "demo");
   assert.match(session?.userId ?? "", /^visitor-/);
+});
+
+test("a demo visitor cannot delete a seed memory, and it survives", async () => {
+  const { backend, rows } = makeFakeBackend([
+    { id: "seed-leo-0", tenantId: "demo", ownerId: "leo", text: "A seeded Leo memory.", createdAt: "2026-01-01T00:00:00.000Z" },
+  ]);
+  setMemoryBackendForTests(backend);
+  const visitor = token({ tenantId: "demo", userId: "visitor-9", role: "demo" });
+
+  assert.equal((await entriesDelete(bare("DELETE", visitor), deleteCtx("seed-leo-0"))).status, 404);
+  assert.ok(rows.some((row) => row.id === "seed-leo-0"), "the seed memory still exists");
+});
+
+test("POST /api/chat returns 429 with a Retry-After once the per-caller limit is hit", async () => {
+  process.env.RATE_LIMIT_CHAT = "1:60";
+  __resetRateLimitsForTests();
+  const tok = token({ tenantId: "demo", userId: "visitor-chat", role: "demo" });
+
+  const first = await chatPost(json("POST", { messages: [{ role: "user", content: "hi" }] }, tok));
+  assert.equal(first.status, 200);
+  await first.text(); // drain the stream
+
+  const second = await chatPost(json("POST", { messages: [{ role: "user", content: "hi again" }] }, tok));
+  assert.equal(second.status, 429);
+  assert.ok(Number(second.headers.get("Retry-After")) > 0, "a Retry-After is set");
+  assert.match(JSON.stringify(await second.json()), /error/);
+});
+
+test("POST /api/voice/transcribe returns 429 once the per-IP limit is hit", async () => {
+  process.env.RATE_LIMIT_VOICE = "1:60";
+  __resetRateLimitsForTests();
+  const tok = token({ tenantId: "demo", userId: "visitor-voice", role: "demo" });
+
+  // First call passes the limiter (then fails later for missing key); the second is limited.
+  await voicePost(bare("POST", tok));
+  const second = await voicePost(bare("POST", tok));
+  assert.equal(second.status, 429);
+  assert.ok(Number(second.headers.get("Retry-After")) > 0);
+});
+
+test("POST /api/session/demo returns 429 once the per-IP mint limit is hit", async () => {
+  process.env.EMORI_DEMO_ACCESS = "on";
+  process.env.RATE_LIMIT_DEMO_MINT = "1:600";
+  __resetRateLimitsForTests();
+
+  assert.equal((await demoSession(mintRequest())).status, 200);
+  const second = await demoSession(mintRequest());
+  assert.equal(second.status, 429);
+  assert.ok(Number(second.headers.get("Retry-After")) > 0);
+  delete process.env.EMORI_DEMO_ACCESS;
 });

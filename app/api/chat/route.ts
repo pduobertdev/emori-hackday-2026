@@ -1,6 +1,7 @@
 import type { ModelMessage } from "ai";
 import { inspectAgentRuntime } from "@/lib/agent/config";
 import { createMateoAgent } from "@/lib/agent/mateo";
+import { RATE_LIMITS, checkRateLimit, clientIp, rateLimitResponse } from "@/lib/auth/rate-limit";
 import { requireSession, type Session } from "@/lib/auth/session";
 import { memoryBackend } from "@/lib/memory/graph/backend";
 import { inspectMemoryGraph } from "@/lib/memory/graph/config";
@@ -9,6 +10,7 @@ import { readScopeFor } from "@/lib/memory/graph/scope";
 import { LEGACY_TENANT_ID } from "@/lib/memory/graph/types";
 import { readDurableImage, readDurableMemory } from "@/lib/memory/store";
 
+export const runtime = "nodejs";
 export const maxDuration = 60;
 
 type IncomingMessage = {
@@ -84,6 +86,13 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const session = requireSession(request);
   if (session instanceof Response) return session;
+
+  // Per IP and per session user, so one abusive user can't drain the model budget and one busy
+  // tenant can't crowd everyone sharing an egress IP.
+  const perIp = checkRateLimit(`chat:ip:${clientIp(request)}`, RATE_LIMITS.chat());
+  if (!perIp.ok) return rateLimitResponse(perIp.retryAfterSeconds);
+  const perUser = checkRateLimit(`chat:user:${session.userId}`, RATE_LIMITS.chat());
+  if (!perUser.ok) return rateLimitResponse(perUser.retryAfterSeconds);
 
   const runtime = inspectAgentRuntime();
   if (!runtime.configured) {

@@ -29,9 +29,17 @@ Each token names a `tenantId`, a `userId`, and a role (`demo` or `member`). Memo
 nodes carry a `tenantId`, and every read filters by it; a Person is keyed by `(tenantId, id)`, so
 the same id can never be shared across tenants. Writes and deletes always target the caller's own
 tenant and user — never values from the request body or query — and deleting a memory that is not
-yours returns `404` without revealing that it exists. Rows created before this change have no
-`tenantId` and are read as the `demo` tenant (`coalesce(m.tenantId,'demo')`), so existing AuraDB
-data keeps working with no migration.
+yours returns `404` without revealing that it exists.
+
+**Legacy rows (no `tenantId`).** Rows created before tenants existed carry no `tenantId`. To keep
+the AuraDB demo working with no migration, such a row is still readable — but only when the tenant
+is `demo` **and** its id begins with the curated-seed prefix `seed-` (the ids the seed script
+writes). That keeps the hand-authored Leo/Mateo seed visible while hiding anything a past public
+visitor may have typed under the shared `leo` owner, which would otherwise have been exposed to
+every visitor. Everything written from now on is tenant-tagged explicitly. Deployers should run
+`npm run memory:seed -- --reset` against Aura once so the seed is re-created with stable `seed-…`
+ids and an explicit `demo` `tenantId`; the seed script also reconciles any legacy `leo`/`mateo`
+`Person` into the demo tenant so a non-reset run can't leave a duplicate.
 
 - **Demo (public, no login).** When `EMORI_DEMO_ACCESS=on`, a page load mints a fresh anonymous
   visitor session in the `demo` tenant (role `demo`, 12h) via `proxy.ts`; `POST /api/session/demo`
@@ -48,8 +56,22 @@ data keeps working with no migration.
 
   A member reads only their own memories plus the tenant's curated storyteller.
 
-Model and voice routes accept demo sessions (that is the demo). Rate limiting per session is a
-sensible follow-up and is intentionally left out of this change.
+Model and voice routes accept demo sessions (that is the demo), so they are rate-limited to keep
+the free demo from draining the paid model/voice budget:
+
+- `POST /api/session/demo` and the `proxy.ts` auto-mint share a per-IP budget (default **10 per
+  10 min**). The mint returns the session **only** as the HttpOnly cookie — never in the JSON body,
+  so a token can't be scraped and replayed.
+- `POST /api/chat` is limited per IP **and** per session `userId` (default **30 per min** each).
+- `POST /api/voice/transcribe` is limited per IP (default **10 per min**).
+
+Over-limit requests get `429` with a `Retry-After` header. Each limit is overridable with an env
+var in `limit:windowSeconds` form — `RATE_LIMIT_DEMO_MINT`, `RATE_LIMIT_CHAT`, `RATE_LIMIT_VOICE`.
+
+**This limiter is per-instance best-effort.** It keeps counts in an in-memory `Map`, so on
+serverless (Vercel) every warm instance has its own counters and the effective cap is roughly the
+limit times the number of live instances. The follow-up for a hard global cap is a shared store —
+Vercel KV or Upstash Redis, both have a free tier — behind the same `checkRateLimit` call site.
 
 ## Agent runtime
 
