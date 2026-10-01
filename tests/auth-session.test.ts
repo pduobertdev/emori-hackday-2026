@@ -12,10 +12,12 @@ import {
   verifySession,
 } from "../lib/auth/session";
 
-const SECRET = "x".repeat(32);
+// A strong, high-entropy secret (every hex digit twice → ~4 bits/char), so it passes the entropy gate.
+const SECRET = "0a1b2c3d4e5f60718293a4b5c6d7e8f9";
 
 afterEach(() => {
   delete process.env.EMORI_SESSION_SECRET;
+  delete process.env.EMORI_DEMO_ACCESS;
 });
 
 function bearer(token: string) {
@@ -26,6 +28,16 @@ test("getSessionSecret requires at least 32 characters", () => {
   assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: "short" }), null);
   assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: SECRET }), SECRET);
   assert.equal(getSessionSecret({}), null);
+});
+
+test("getSessionSecret rejects low-entropy and padded secrets", () => {
+  // Long enough but trivially weak — one repeated character.
+  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: "x".repeat(32) }), null);
+  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: "ab".repeat(16) }), null);
+  // Padded whitespace does not count toward strength: raw must equal trimmed.
+  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: `  ${SECRET}  ` }), null);
+  // A real random-looking secret is accepted.
+  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: SECRET }), SECRET);
 });
 
 test("a signed session round-trips through verify", () => {
@@ -72,6 +84,21 @@ test("the token is read from a Bearer header or the session cookie", () => {
   });
   assert.equal(sessionTokenFromRequest(withCookie), "tok-456");
   assert.equal(sessionTokenFromRequest(new Request("http://localhost/api")), undefined);
+
+  // A malformed %-encoding must not throw — it is treated as no token.
+  const malformed = new Request("http://localhost/api", { headers: { cookie: `${COOKIE_NAME}=%E0%A4%A` } });
+  assert.equal(sessionTokenFromRequest(malformed), undefined);
+});
+
+test("requireSession treats a malformed cookie as no session (401, never 500)", () => {
+  process.env.EMORI_SESSION_SECRET = SECRET;
+  const request = new Request("http://localhost/api", {
+    method: "POST",
+    headers: { cookie: `${COOKIE_NAME}=%E0%A4%A` },
+  });
+  const result = requireSession(request);
+  assert.ok(result instanceof Response);
+  assert.equal((result as Response).status, 401);
 });
 
 test("requireSession returns the session for a valid Bearer token", () => {
@@ -104,6 +131,72 @@ test("a demo session is scoped to the demo tenant with a fresh visitor id", () =
   assert.match(a.userId, /^visitor-/);
   assert.notEqual(a.userId, b.userId);
   assert.ok(a.exp * 1000 > Date.now());
+});
+
+test("requireSession rejects a demo token unless EMORI_DEMO_ACCESS is on (kill switch)", () => {
+  process.env.EMORI_SESSION_SECRET = SECRET;
+  const demo = signSession(createSession({ tenantId: "demo", userId: "visitor-1", role: "demo", ttlSeconds: 3600 }), SECRET);
+  const member = signSession(createSession({ tenantId: "acme", userId: "alice", role: "member", ttlSeconds: 3600 }), SECRET);
+
+  delete process.env.EMORI_DEMO_ACCESS;
+  assert.equal((requireSession(bearer(demo)) as Response).status, 401, "demo token blocked when demo is off");
+  assert.ok(!(requireSession(bearer(member)) instanceof Response), "member token still works when demo is off");
+
+  process.env.EMORI_DEMO_ACCESS = "on";
+  assert.ok(!(requireSession(bearer(demo)) instanceof Response), "demo token works when demo is on");
+});
+
+// --- Origin / CSRF check on cookie-authenticated state-changing requests ---
+
+function cookieRequest(
+  method: string,
+  headers: Record<string, string> = {},
+): Request {
+  const token = signSession(createSession({ tenantId: "acme", userId: "alice", role: "member", ttlSeconds: 3600 }), SECRET);
+  return new Request("http://localhost/api", { method, headers: { cookie: `${COOKIE_NAME}=${token}`, ...headers } });
+}
+
+test("a cross-origin cookie POST is rejected with 403; same-origin and safe methods pass", () => {
+  process.env.EMORI_SESSION_SECRET = SECRET;
+
+  // Same-origin Origin (host matches the request URL host) is allowed.
+  assert.ok(!(requireSession(cookieRequest("POST", { origin: "http://localhost" })) instanceof Response));
+
+  // Cross-origin Origin on a state-changing method is blocked.
+  const blocked = requireSession(cookieRequest("POST", { origin: "https://evil.example" }));
+  assert.ok(blocked instanceof Response);
+  assert.equal((blocked as Response).status, 403);
+
+  // A safe method (GET) is never origin-checked.
+  assert.ok(!(requireSession(cookieRequest("GET", { origin: "https://evil.example" })) instanceof Response));
+});
+
+test("the origin check falls back to Sec-Fetch-Site, and allows when neither header is present", () => {
+  process.env.EMORI_SESSION_SECRET = SECRET;
+
+  assert.equal(
+    (requireSession(cookieRequest("POST", { "sec-fetch-site": "cross-site" })) as Response).status,
+    403,
+    "Sec-Fetch-Site: cross-site is rejected when no Origin is present",
+  );
+  assert.ok(
+    !(requireSession(cookieRequest("POST", { "sec-fetch-site": "same-origin" })) instanceof Response),
+    "same-origin fetch is allowed",
+  );
+  assert.ok(
+    !(requireSession(cookieRequest("POST")) instanceof Response),
+    "no Origin and no Sec-Fetch-Site (non-browser client) is allowed",
+  );
+});
+
+test("a Bearer-authenticated cross-origin POST is exempt from the origin check", () => {
+  process.env.EMORI_SESSION_SECRET = SECRET;
+  const token = signSession(createSession({ tenantId: "acme", userId: "alice", role: "member", ttlSeconds: 3600 }), SECRET);
+  const request = new Request("http://localhost/api", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, origin: "https://evil.example" },
+  });
+  assert.ok(!(requireSession(request) instanceof Response), "Bearer clients are not subject to CSRF origin checks");
 });
 
 test("buildSessionCookie marks the cookie HttpOnly and SameSite=Lax", () => {

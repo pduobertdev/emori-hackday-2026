@@ -52,38 +52,62 @@ every visitor. Everything written from now on is tenant-tagged explicitly.
 - **Members (real tenants).** There is no signup UI. Mint a token for a real tenant/user with:
 
   ```bash
-  npm run session:mint -- --tenant acme --user alice            # 30-day token
-  npm run session:mint -- --tenant acme --user alice --ttl 3600 # custom TTL (seconds)
+  npm run session:mint -- --tenant acme --user alice            # 24-hour token (default)
+  npm run session:mint -- --tenant acme --user alice --ttl 3600 # custom TTL in seconds
   ```
 
-  A member reads only their own memories plus the tenant's curated storyteller.
+  A member reads only their own memories plus the tenant's curated storyteller. The default TTL is
+  **24 hours**, and `--ttl` is capped at **7 days** — a longer value is rejected. There is no
+  revocation other than rotating `EMORI_SESSION_SECRET` (which logs everyone out), so keep TTLs short.
 
 Model and voice routes accept demo sessions (that is the demo), so they are rate-limited to keep
-the free demo from draining the paid model/voice budget:
+the free demo from draining the paid model/voice budget. Each limit is checked right after auth and
+**before any model or database work**, and over-limit requests get a `429` with a `Retry-After`
+header (no model/DB cost on a rejected request):
 
 - `POST /api/session/demo` and the `proxy.ts` auto-mint both apply a per-IP limit (default **10 per
   10 min**) under the same key name — but counts are per-instance (see below), so the two are
   independent budgets, not a single shared cap. The mint returns the session **only** as the
   HttpOnly cookie — never in the JSON body, so a token can't be scraped and replayed.
 - `POST /api/chat` is limited per IP **and** per session `userId` (default **30 per min** each).
-- `POST /api/voice/transcribe` is limited per IP (default **10 per min**).
+- The paid memory routes — `POST /api/memory/ask`, `POST /api/memory/propose`,
+  `POST /api/memory/entries` and `PUT /api/memory` — are each limited per session `userId` (default
+  **20 per min**) **and** per IP (default **40 per min**).
+- `POST /api/voice/transcribe` is limited per session `userId` **and** per IP (default **10 per min**).
 
-Over-limit requests get `429` with a `Retry-After` header. Each limit is overridable with an env
-var in `limit:windowSeconds` form — `RATE_LIMIT_DEMO_MINT`, `RATE_LIMIT_CHAT`, `RATE_LIMIT_VOICE`.
+Each limit is overridable with an env var in `limit:windowSeconds` form — `RATE_LIMIT_DEMO_MINT`,
+`RATE_LIMIT_CHAT`, `RATE_LIMIT_MODEL`, `RATE_LIMIT_MODEL_IP`, `RATE_LIMIT_VOICE`.
 
-**This limiter is per-instance best-effort.** It keeps counts in an in-memory `Map`, so on
-serverless (Vercel) every warm instance has its own counters and the effective cap is roughly the
-limit times the number of live instances. The Map is capped at 10k live keys; when full it fails
-closed (new callers get `429`) so it can't grow without bound. The follow-up for a hard global cap
-is a shared store — Vercel KV or Upstash Redis, both have a free tier — behind the same
-`checkRateLimit` call site.
+**This limiter is per-instance best-effort.** It keeps counts in memory behind a small
+`RateLimitStore` interface (`hit(key, rule, now)`), so on serverless (Vercel) every warm instance
+has its own counters and the effective cap is roughly the limit times the number of live instances.
+To get a hard global cap, implement `RateLimitStore` against a shared store — Vercel KV or Upstash
+Redis, both have a free tier — and `await checkRateLimit(...)` (the interface already allows a
+`Promise` return); no call site changes otherwise.
 
-**IP trust assumption.** The per-IP key is derived from `x-vercel-forwarded-for` / `x-real-ip`
-(which Vercel sets from the real connection and the client cannot forge), falling back to the *last*
-`x-forwarded-for` hop. The *first* `x-forwarded-for` hop is deliberately ignored — it is
-client-controlled, so trusting it would let a caller mint a fresh bucket per request. This assumes
-deployment behind Vercel (or an equivalent proxy that sets those headers); self-hosting behind a
-different proxy may need the header choice in `clientIp` revisited.
+The in-memory store keeps **separate bounded partitions** per key class — one for per-user buckets,
+one for per-IP buckets, one for demo-mint buckets (10k each). Each partition evicts its
+**least-recently-used** key when full (it never fails closed globally, so a flood can't lock out
+legitimate callers). Crucially, a flood of spoofed/distinct IPs can only ever evict *IP* buckets:
+it can never evict or lock out a per-user bucket, so the per-user limit is the real control on every
+authenticated route. (Evicting an IP bucket resets that IP's counter — acceptable, because the
+per-user limit still holds.)
+
+**IP trust assumption.** The per-IP key is derived **only** from `x-vercel-forwarded-for` then
+`x-real-ip` (which Vercel sets from the real connection and the client cannot forge). `x-forwarded-for`
+is **ignored entirely** — off-Vercel it is fully client-controlled, so trusting any of its hops would
+let a caller mint a fresh bucket per request. If neither trusted header is present (off-Vercel, or
+behind a proxy that doesn't set `x-real-ip`), all requests share one `"unknown"` IP bucket — safe,
+since it only ever over-limits, and the per-user limit is the real control. **Deploy behind Vercel**
+(or a proxy that sets `x-real-ip`) for meaningful per-IP limits.
+
+**CSRF / origin check.** For cookie-authenticated state-changing requests (POST/PUT/DELETE/PATCH),
+the server rejects (`403`) a request whose `Origin` is not same-origin with the app host; with no
+`Origin` it falls back to `Sec-Fetch-Site` (rejecting an explicit `cross-site`), and allows requests
+that send neither header (non-browser clients). Bearer-authenticated requests are exempt.
+
+**Demo kill switch.** A `demo`-role token is only accepted while `EMORI_DEMO_ACCESS=on`; turning the
+flag off immediately stops honoring already-issued demo tokens (member tokens are unaffected).
 
 ## Agent runtime
 

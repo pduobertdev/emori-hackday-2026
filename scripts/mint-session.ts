@@ -10,7 +10,8 @@ function flag(name: string): string | undefined {
   return index !== -1 ? process.argv[index + 1] : undefined;
 }
 
-const DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+const DEFAULT_TTL_SECONDS = 24 * 60 * 60; // 24 hours
+const MAX_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days — hard cap so a stolen token can't live for weeks
 
 function main() {
   const tenantId = flag("tenant");
@@ -24,6 +25,11 @@ function main() {
   }
   if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
     console.error("--ttl must be a positive number of seconds.");
+    process.exitCode = 1;
+    return;
+  }
+  if (ttlSeconds > MAX_TTL_SECONDS) {
+    console.error(`--ttl cannot exceed ${MAX_TTL_SECONDS} seconds (7 days).`);
     process.exitCode = 1;
     return;
   }

@@ -9,7 +9,12 @@ export async function POST(request: Request) {
   const session = requireSession(request);
   if (session instanceof Response) return session;
 
-  const formData = await request.formData();
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return Response.json({ error: "Send the image as multipart/form-data." }, { status: 400 });
+  }
   const image = formData.get("image");
 
   if (!(image instanceof File)) {

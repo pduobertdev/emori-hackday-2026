@@ -1,4 +1,4 @@
-import { RATE_LIMITS, checkRateLimit, clientIp, rateLimitResponse } from "@/lib/auth/rate-limit";
+import { RATE_LIMITS, enforceIpAndUserLimit } from "@/lib/auth/rate-limit";
 import { requireSession } from "@/lib/auth/session";
 
 const ELEVENLABS_TRANSCRIPTION_URL = "https://api.elevenlabs.io/v1/speech-to-text";
@@ -31,8 +31,9 @@ export async function POST(request: Request) {
   const session = requireSession(request);
   if (session instanceof Response) return session;
 
-  const limited = checkRateLimit(`voice:ip:${clientIp(request)}`, RATE_LIMITS.voice());
-  if (!limited.ok) return rateLimitResponse(limited.retryAfterSeconds);
+  // Paid transcription call — limit per IP and per user before reading the upload or calling out.
+  const limited = enforceIpAndUserLimit("voice", session.userId, request, RATE_LIMITS.voice(), RATE_LIMITS.voice());
+  if (limited) return limited;
 
   const apiKey = process.env.ELEVENLABS_API_KEY?.trim();
 

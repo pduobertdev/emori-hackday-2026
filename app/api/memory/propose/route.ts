@@ -1,4 +1,5 @@
 import { inspectAgentRuntime } from "@/lib/agent/config";
+import { RATE_LIMITS, enforceIpAndUserLimit } from "@/lib/auth/rate-limit";
 import { requireSession } from "@/lib/auth/session";
 import { memoryBackend } from "@/lib/memory/graph/backend";
 import { inspectMemoryGraph } from "@/lib/memory/graph/config";
@@ -18,6 +19,10 @@ const MAX_MESSAGE_LENGTH = 12_000;
 export async function POST(request: Request) {
   const session = requireSession(request);
   if (session instanceof Response) return session;
+
+  // Paid model call — limit per IP and per user before any model/DB work.
+  const limited = enforceIpAndUserLimit("model", session.userId, request, RATE_LIMITS.modelIp(), RATE_LIMITS.model());
+  if (limited) return limited;
 
   if (!inspectMemoryGraph().configured) {
     return Response.json({ error: "The memory graph is not configured." }, { status: 503 });

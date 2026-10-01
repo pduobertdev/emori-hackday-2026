@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
 import {
+  InMemoryRateLimitStore,
   RATE_LIMITS,
   __resetRateLimitsForTests,
   checkRateLimit,
@@ -43,43 +44,67 @@ test("keys are independent", () => {
   assert.equal(checkRateLimit("a", rule, now).ok, false);
 });
 
-test("clientIp uses platform headers and the LAST x-forwarded-for hop, never the spoofable first", () => {
+test("clientIp uses only platform headers; x-forwarded-for is ignored entirely", () => {
   const h = (headers: Record<string, string>) => ({ headers: new Headers(headers) });
   assert.equal(clientIp(h({ "x-vercel-forwarded-for": "11.11.11.11" })), "11.11.11.11");
   assert.equal(clientIp(h({ "x-real-ip": "9.9.9.9" })), "9.9.9.9");
-  // The proxy appends the real IP, so the last hop is the trustworthy one.
-  assert.equal(clientIp(h({ "x-forwarded-for": "6.6.6.6, 2.2.2.2" })), "2.2.2.2");
+  // x-forwarded-for is client-controllable off-Vercel, so it is never trusted — not even the last hop.
+  assert.equal(clientIp(h({ "x-forwarded-for": "6.6.6.6, 2.2.2.2" })), "unknown");
   assert.equal(clientIp(h({})), "unknown");
-  // Platform header wins over raw XFF even when both are present.
+  // Platform header wins over XFF even when both are present.
   assert.equal(clientIp(h({ "x-real-ip": "9.9.9.9", "x-forwarded-for": "6.6.6.6, 2.2.2.2" })), "9.9.9.9");
 });
 
-test("a spoofed first x-forwarded-for hop cannot mint a fresh rate-limit bucket", () => {
+test("a spoofed x-forwarded-for cannot mint a fresh rate-limit bucket", () => {
   const rule = { limit: 1, windowSeconds: 60 };
   const now = 4_000_000;
-  // Same real (last) hop, attacker rotates only the first hop.
-  const req = (forgedFirst: string) => ({ headers: new Headers({ "x-forwarded-for": `${forgedFirst}, 2.2.2.2` }) });
+  // Attacker rotates x-forwarded-for; with no trusted header it collapses to one "unknown" bucket.
+  const req = (forged: string) => ({ headers: new Headers({ "x-forwarded-for": forged }) });
   assert.equal(checkRateLimit(`demo-mint:${clientIp(req("a.a.a.a"))}`, rule, now).ok, true);
   assert.equal(
-    checkRateLimit(`demo-mint:${clientIp(req("b.b.b.b"))}`, rule, now).ok,
+    checkRateLimit(`demo-mint:${clientIp(req("b.b.b.b, c.c.c.c"))}`, rule, now).ok,
     false,
-    "rotating the forged first hop maps to the same bucket and is blocked",
+    "any spoofed XFF maps to the same 'unknown' bucket and is blocked",
   );
 });
 
-test("caps the bucket Map and fails closed for brand-new keys when it is full of live buckets", () => {
-  const rule = { limit: 5, windowSeconds: 60 };
+test("a full partition evicts the least-recently-used key, never fails closed", () => {
+  const store = new InMemoryRateLimitStore(2); // cap 2 buckets per partition
+  const rule = { limit: 2, windowSeconds: 60 };
   const now = 5_000_000;
-  for (let i = 0; i < 10_000; i++) {
-    assert.equal(checkRateLimit(`cap-${i}`, rule, now).ok, true);
-  }
-  const overflow = checkRateLimit("cap-overflow", rule, now);
-  assert.equal(overflow.ok, false, "a new key is rejected while the Map is full");
-  if (!overflow.ok) assert.equal(overflow.retryAfterSeconds, rule.windowSeconds);
-  // An already-tracked key still counts (it does not grow the Map).
-  assert.equal(checkRateLimit("cap-0", rule, now).ok, true);
-  // Once live buckets expire, a new key is admitted again.
-  assert.equal(checkRateLimit("cap-overflow", rule, now + 61_000).ok, true);
+
+  assert.equal(store.hit("x:ip:a", rule, now).ok, true); // a=1
+  assert.equal(store.hit("x:ip:b", rule, now).ok, true); // b=1, partition full
+  assert.equal(store.hit("x:ip:a", rule, now).ok, true); // a=2 → a most-recent, b is now LRU
+  assert.equal(store.hit("x:ip:c", rule, now).ok, true); // new key admitted → evicts LRU (b)
+
+  assert.equal(store.hit("x:ip:a", rule, now).ok, false, "a was recently used, so it is preserved and still at its limit");
+  assert.equal(store.hit("x:ip:b", rule, now).ok, true, "b was the LRU, so it was evicted and its counter reset");
+});
+
+test("a flood of distinct IPs can never evict or lock out a per-user bucket", () => {
+  const store = new InMemoryRateLimitStore(100);
+  const rule = { limit: 1, windowSeconds: 60 };
+  const now = 6_000_000;
+
+  assert.equal(store.hit("chat:user:alice", rule, now).ok, true); // alice at her limit
+
+  // Flood the IP partition far beyond its capacity — only the IP partition evicts.
+  for (let i = 0; i < 1_000; i++) store.hit(`chat:ip:${i}`, rule, now);
+
+  assert.equal(store.hit("chat:user:alice", rule, now).ok, false, "alice's user bucket survived the IP flood");
+  assert.equal(store.hit("chat:user:bob", rule, now).ok, true, "a fresh user is not locked out by the IP flood");
+});
+
+test("demo-mint keys live in their own partition, separate from per-IP buckets", () => {
+  const store = new InMemoryRateLimitStore(1); // one bucket per partition
+  const rule = { limit: 1, windowSeconds: 60 };
+  const now = 7_000_000;
+
+  assert.equal(store.hit("demo-mint:1.2.3.4", rule, now).ok, true);
+  // A per-IP key for a different class does not evict the lone demo-mint bucket (different partition).
+  assert.equal(store.hit("chat:ip:1.2.3.4", rule, now).ok, true);
+  assert.equal(store.hit("demo-mint:1.2.3.4", rule, now).ok, false, "the demo-mint bucket is intact");
 });
 
 test("env overrides the default rule when well-formed, and is ignored when not", () => {

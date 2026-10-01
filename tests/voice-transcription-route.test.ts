@@ -7,7 +7,8 @@ const SECRET = "voice-secret-0123456789-abcdefghij";
 
 function authed(body: FormData): Request {
   process.env.EMORI_SESSION_SECRET = SECRET;
-  const token = signSession(createSession({ tenantId: "demo", userId: "visitor-1", role: "demo", ttlSeconds: 3600 }), SECRET);
+  // A member token: role-independent, so it does not depend on EMORI_DEMO_ACCESS being on.
+  const token = signSession(createSession({ tenantId: "acme", userId: "alice", role: "member", ttlSeconds: 3600 }), SECRET);
   return new Request("http://localhost/api/voice/transcribe", {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },

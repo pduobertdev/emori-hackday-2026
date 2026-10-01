@@ -1,3 +1,4 @@
+import { RATE_LIMITS, enforceIpAndUserLimit } from "@/lib/auth/rate-limit";
 import { requireSession } from "@/lib/auth/session";
 import { inspectMemoryGraph, isAuraMemoryGraph } from "@/lib/memory/graph/config";
 import { NO_STORE, memoryGraphErrorResponse } from "@/lib/memory/graph/http";
@@ -25,6 +26,10 @@ export async function GET(request: Request) {
 export async function PUT(request: Request) {
   const session = requireSession(request);
   if (session instanceof Response) return session;
+
+  // Saving a memory may call the paid model to index it — limit per IP and per user first.
+  const limited = enforceIpAndUserLimit("model", session.userId, request, RATE_LIMITS.modelIp(), RATE_LIMITS.model());
+  if (limited) return limited;
 
   let payload: unknown;
 

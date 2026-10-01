@@ -38,6 +38,8 @@ let model: Awaited<ReturnType<typeof startMockModel>>;
 
 function applyConfigEnv() {
   process.env.EMORI_SESSION_SECRET = SECRET;
+  // Demo tokens are used throughout these tests; requireSession now gates them on this flag.
+  process.env.EMORI_DEMO_ACCESS = "on";
   for (const [key, value] of Object.entries(CONFIG_ENV)) process.env[key] = value;
   process.env.AI_BASE_URL = model.baseURL;
   delete process.env.CRUSOE_API_KEY;
@@ -75,7 +77,11 @@ function inScope(row: Row, scope: ReadScope): boolean {
 function makeFakeBackend(seed: Row[] = []) {
   const rows: Row[] = [...seed];
   let seq = 0;
-  const seen: { reads: ReadScope[]; questions: ReadScope[] } = { reads: [], questions: [] };
+  const seen: { reads: ReadScope[]; questions: ReadScope[]; lists: ReadScope[] } = {
+    reads: [],
+    questions: [],
+    lists: [],
+  };
 
   const backend: MemoryBackend = {
     async saveMemory(input) {
@@ -91,6 +97,7 @@ function makeFakeBackend(seed: Row[] = []) {
       return { memory: toRecord(row), entities: 0, relations: 0 };
     },
     async listMemories(scope) {
+      seen.lists.push(scope);
       return rows.filter((row) => inScope(row, scope)).map(toRecord);
     },
     async recallMemories(_query, scope) {
@@ -157,6 +164,8 @@ afterEach(() => {
   delete process.env.RATE_LIMIT_CHAT;
   delete process.env.RATE_LIMIT_VOICE;
   delete process.env.RATE_LIMIT_DEMO_MINT;
+  delete process.env.RATE_LIMIT_MODEL;
+  delete process.env.RATE_LIMIT_MODEL_IP;
 });
 
 // Every protected route, exercised with no token and with a tampered token, with all
@@ -337,4 +346,153 @@ test("POST /api/session/demo returns 429 once the per-IP mint limit is hit", asy
   assert.equal(second.status, 429);
   assert.ok(Number(second.headers.get("Retry-After")) > 0);
   delete process.env.EMORI_DEMO_ACCESS;
+});
+
+// --- Rate limits on the paid model/voice routes (H1) ---
+
+function ipReq(method: string, body: unknown, tok: string, ip: string): Request {
+  return new Request("http://localhost/api", {
+    method,
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${tok}`, "x-real-ip": ip },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
+async function drain(res: Response): Promise<void> {
+  try {
+    await res.text();
+  } catch {
+    /* already consumed or no body */
+  }
+}
+
+function freshBackend() {
+  const fake = makeFakeBackend();
+  setMemoryBackendForTests(fake.backend);
+  return fake;
+}
+
+// Each paid model route, with a way to observe whether its model/DB work ran (so we can prove the
+// 429 short-circuits before any cost). `calls` reads a counter the fake backend bumps on the work
+// the handler does: ask → memoriesForQuestion, propose → listMemories, entries/PUT → saveMemory.
+type Fake = ReturnType<typeof makeFakeBackend>;
+const MODEL_PROBES: Array<{
+  name: string;
+  call: (tok: string, ip: string) => Promise<Response>;
+  calls: (fake: Fake) => number;
+}> = [
+  {
+    name: "POST /api/memory/ask",
+    call: (t, ip) => askPost(ipReq("POST", { question: "what is stored here?" }, t, ip)),
+    calls: (f) => f.seen.questions.length,
+  },
+  {
+    name: "POST /api/memory/propose",
+    call: (t, ip) => proposePost(ipReq("POST", { messages: [{ role: "user", content: "i like hiking and tea" }] }, t, ip)),
+    calls: (f) => f.seen.lists.length,
+  },
+  {
+    name: "POST /api/memory/entries",
+    call: (t, ip) => entriesPost(ipReq("POST", { text: "a brand new memory" }, t, ip)),
+    calls: (f) => f.rows.length,
+  },
+  {
+    name: "PUT /api/memory",
+    call: (t, ip) => memoryPut(ipReq("PUT", { text: "a brand new memory" }, t, ip)),
+    calls: (f) => f.rows.length,
+  },
+];
+
+for (const probe of MODEL_PROBES) {
+  test(`${probe.name} enforces a per-USER model limit, even from rotating IPs`, async () => {
+    process.env.RATE_LIMIT_MODEL = "1:60"; // per-user limit = 1
+    process.env.RATE_LIMIT_MODEL_IP = "100:60"; // per-IP generous, so the user limit is what fires
+    __resetRateLimitsForTests();
+    const fake = freshBackend();
+    const tok = token({ tenantId: "demo", userId: `user-${probe.name}`, role: "demo" });
+
+    const first = await probe.call(tok, "1.1.1.1");
+    assert.notEqual(first.status, 429, "the first call is allowed through");
+    await drain(first);
+    const before = probe.calls(fake);
+
+    const second = await probe.call(tok, "2.2.2.2"); // same user, different IP
+    assert.equal(second.status, 429, "the per-user limit blocks even from a fresh IP");
+    assert.ok(Number(second.headers.get("Retry-After")) > 0, "a Retry-After is set");
+    assert.equal(probe.calls(fake), before, "the model/DB is not touched on the 429 request");
+  });
+
+  test(`${probe.name} enforces a per-IP model limit, even from rotating users`, async () => {
+    process.env.RATE_LIMIT_MODEL = "100:60"; // per-user generous
+    process.env.RATE_LIMIT_MODEL_IP = "1:60"; // per-IP limit = 1
+    __resetRateLimitsForTests();
+    const fake = freshBackend();
+
+    const first = await probe.call(token({ tenantId: "demo", userId: "user-A", role: "demo" }), "9.9.9.9");
+    assert.notEqual(first.status, 429, "the first call is allowed through");
+    await drain(first);
+    const before = probe.calls(fake);
+
+    const second = await probe.call(token({ tenantId: "demo", userId: "user-B", role: "demo" }), "9.9.9.9");
+    assert.equal(second.status, 429, "the per-IP limit blocks a different user on the same IP");
+    assert.equal(probe.calls(fake), before, "the model/DB is not touched on the 429 request");
+  });
+}
+
+test("POST /api/voice/transcribe enforces a per-USER limit, even from rotating IPs", async () => {
+  process.env.RATE_LIMIT_VOICE = "1:60";
+  __resetRateLimitsForTests();
+  const tok = token({ tenantId: "demo", userId: "voice-user", role: "demo" });
+
+  const first = await voicePost(ipReq("POST", undefined, tok, "1.1.1.1"));
+  assert.notEqual(first.status, 429, "first call passes the limiter (then 503 for the missing key)");
+  const second = await voicePost(ipReq("POST", undefined, tok, "2.2.2.2"));
+  // 429 (not 503) proves the limiter short-circuited before the transcription call.
+  assert.equal(second.status, 429, "the per-user voice limit blocks even from a fresh IP");
+  assert.ok(Number(second.headers.get("Retry-After")) > 0);
+});
+
+test("POST /api/voice/transcribe enforces a per-IP limit, even from rotating users", async () => {
+  process.env.RATE_LIMIT_VOICE = "1:60";
+  __resetRateLimitsForTests();
+
+  const first = await voicePost(ipReq("POST", undefined, token({ tenantId: "demo", userId: "vA", role: "demo" }), "7.7.7.7"));
+  assert.notEqual(first.status, 429);
+  const second = await voicePost(ipReq("POST", undefined, token({ tenantId: "demo", userId: "vB", role: "demo" }), "7.7.7.7"));
+  assert.equal(second.status, 429, "the per-IP voice limit blocks a different user on the same IP");
+});
+
+test("POST /api/chat enforces a per-USER limit independently of the per-IP limit (M24)", async () => {
+  process.env.RATE_LIMIT_CHAT = "1:60";
+  __resetRateLimitsForTests();
+  const tok = token({ tenantId: "demo", userId: "chat-user", role: "demo" });
+
+  const first = await chatPost(ipReq("POST", { messages: [{ role: "user", content: "hi" }] }, tok, "1.1.1.1"));
+  assert.equal(first.status, 200);
+  await drain(first);
+
+  const second = await chatPost(ipReq("POST", { messages: [{ role: "user", content: "hi again" }] }, tok, "2.2.2.2"));
+  assert.equal(second.status, 429, "same user, new IP → still blocked by the per-user limit");
+});
+
+test("POST /api/chat enforces a per-IP limit independently of the per-user limit (M25)", async () => {
+  process.env.RATE_LIMIT_CHAT = "1:60";
+  __resetRateLimitsForTests();
+
+  const first = await chatPost(ipReq("POST", { messages: [{ role: "user", content: "hi" }] }, token({ tenantId: "demo", userId: "cA", role: "demo" }), "5.5.5.5"));
+  assert.equal(first.status, 200);
+  await drain(first);
+
+  const second = await chatPost(ipReq("POST", { messages: [{ role: "user", content: "hi" }] }, token({ tenantId: "demo", userId: "cB", role: "demo" }), "5.5.5.5"));
+  assert.equal(second.status, 429, "different user, same IP → blocked by the per-IP limit");
+});
+
+test("POST /api/memory/image returns 400 (not 500) for a non-multipart body", async () => {
+  const tok = token({ tenantId: "demo", userId: "img-user", role: "demo" });
+  const request = new Request("http://localhost/api", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${tok}` },
+    body: JSON.stringify({ not: "multipart" }),
+  });
+  assert.equal((await imagePost(request)).status, 400);
 });

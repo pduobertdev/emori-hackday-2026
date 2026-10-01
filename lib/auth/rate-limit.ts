@@ -1,63 +1,128 @@
 /**
  * A tiny per-key fixed-window rate limiter with no dependencies. Counts hits against a key in an
- * in-memory Map; when the window elapses the count resets. This is best-effort and PER INSTANCE:
- * on serverless (Vercel) each warm instance keeps its own Map, so the real cap is roughly the
- * configured limit times the number of live instances. A shared store (Vercel KV / Upstash free
- * tier) is the follow-up for a global limit; see the README.
+ * in-memory store; when the window elapses the count resets. This is best-effort and PER INSTANCE:
+ * on serverless (Vercel) each warm instance keeps its own counters, so the real cap is roughly the
+ * configured limit times the number of live instances.
+ *
+ * The limiter sits behind a small store interface so a shared store (Vercel KV / Upstash Redis free
+ * tier) can plug in later for a global cap without touching the call sites — see the README. The
+ * default `InMemoryRateLimitStore` is synchronous; a network-backed store would return a Promise,
+ * which the interface allows, and the call sites would then `await checkRateLimit(...)`.
  */
 
 export type RateLimitRule = { limit: number; windowSeconds: number };
+export type RateLimitResult = { ok: true } | { ok: false; retryAfterSeconds: number };
+
+/** Pluggable backing store. A future Redis/KV store implements this same `hit`. */
+export interface RateLimitStore {
+  hit(key: string, rule: RateLimitRule, now: number): RateLimitResult | Promise<RateLimitResult>;
+}
 
 type Bucket = { count: number; resetAt: number };
 
-const buckets = new Map<string, Bucket>();
-let lastPrune = 0;
-const PRUNE_INTERVAL_MS = 60_000;
 /**
- * Hard ceiling on distinct live keys. Expired buckets are pruned lazily every 60s, but keys created
- * within a window accumulate until then, so cap the Map to bound memory. When it is full of live
- * buckets we fail closed (reject new keys with 429): cheaper to turn away a new caller than to let
- * the Map — and the paid model/voice calls it guards — grow without bound.
+ * Keys live in SEPARATE bounded partitions by class, so no partition can evict another's buckets:
+ * - "user": per signed session userId. The real control for every authenticated route.
+ * - "ip":   per client IP. Shared by callers behind one NAT; evictable (see below).
+ * - "mint":  per IP for demo-session minting (no user exists yet).
+ *
+ * A flood of spoofed/distinct IPs can only ever fill and evict the "ip" (or "mint") partition; it
+ * can never evict or lock out "user" buckets, so an authenticated caller's per-user limit always
+ * holds. Keys carry a class prefix (see the key builders at the call sites: `*:user:*`, `*:ip:*`,
+ * `demo-mint:*`) and are routed to a partition here.
  */
-const MAX_BUCKETS = 10_000;
+type Partition = "user" | "ip" | "mint";
 
-/** Delete every expired bucket right now. */
-function pruneExpired(now: number): void {
-  for (const [key, bucket] of buckets) {
-    if (bucket.resetAt <= now) buckets.delete(key);
+function partitionFor(key: string): Partition {
+  if (key.startsWith("demo-mint:")) return "mint";
+  if (key.includes(":user:")) return "user";
+  return "ip";
+}
+
+/** Hard ceiling on distinct live keys PER PARTITION, to bound memory. */
+const MAX_BUCKETS_PER_PARTITION = 10_000;
+const PRUNE_INTERVAL_MS = 60_000;
+
+/** Delete every expired bucket in one partition right now. */
+function pruneExpired(map: Map<string, Bucket>, now: number): void {
+  for (const [key, bucket] of map) {
+    if (bucket.resetAt <= now) map.delete(key);
   }
-  lastPrune = now;
 }
 
-/** Drop expired buckets occasionally so the Map cannot grow without bound. */
-function prune(now: number): void {
-  if (now - lastPrune < PRUNE_INTERVAL_MS) return;
-  pruneExpired(now);
-}
+/**
+ * In-memory store with per-partition LRU eviction.
+ *
+ * Each partition is a `Map` whose insertion order we maintain as least-recently-used first: a live
+ * hit re-inserts its key to the end, and when a partition is full we evict the first (oldest) key.
+ * Evicting an IP/mint bucket RESETS that IP's counter — acceptable, because every authenticated
+ * route is also gated by the per-user limit, which lives in its own partition and is never evicted
+ * by an IP flood. A user bucket can only be evicted by a flood of distinct signed userIds, which an
+ * attacker can only create through the (separately rate-limited) demo-mint path.
+ */
+export class InMemoryRateLimitStore implements RateLimitStore {
+  private readonly partitions: Record<Partition, Map<string, Bucket>> = {
+    user: new Map(),
+    ip: new Map(),
+    mint: new Map(),
+  };
+  private lastPrune = 0;
 
-export type RateLimitResult = { ok: true } | { ok: false; retryAfterSeconds: number };
+  constructor(private readonly cap: number = MAX_BUCKETS_PER_PARTITION) {}
 
-export function checkRateLimit(key: string, rule: RateLimitRule, now: number = Date.now()): RateLimitResult {
-  prune(now);
+  hit(key: string, rule: RateLimitRule, now: number = Date.now()): RateLimitResult {
+    this.maybePrune(now);
+    const map = this.partitions[partitionFor(key)];
 
-  const existing = buckets.get(key);
-  if (existing && existing.resetAt > now) {
-    if (existing.count >= rule.limit) {
-      return { ok: false, retryAfterSeconds: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)) };
+    const existing = map.get(key);
+    if (existing && existing.resetAt > now) {
+      if (existing.count >= rule.limit) {
+        return { ok: false, retryAfterSeconds: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)) };
+      }
+      existing.count += 1;
+      // Mark most-recently-used: delete + re-set moves the key to the end of the Map's order.
+      map.delete(key);
+      map.set(key, existing);
+      return { ok: true };
     }
-    existing.count += 1;
+
+    // New or expired key. Drop an expired one so the fresh bucket re-inserts at the end (recent).
+    if (existing) map.delete(key);
+
+    // Keep the partition bounded: prune expired, then evict the least-recently-used if still full.
+    if (map.size >= this.cap) {
+      pruneExpired(map, now);
+      if (map.size >= this.cap) {
+        const oldest = map.keys().next().value;
+        if (oldest !== undefined) map.delete(oldest);
+      }
+    }
+
+    map.set(key, { count: 1, resetAt: now + rule.windowSeconds * 1000 });
     return { ok: true };
   }
 
-  // Brand-new key (an expired `existing` is replaced in place and does not grow the Map). Guard the
-  // cap first: prune expired buckets, and if the Map is still full of live ones, fail closed.
-  if (!existing && buckets.size >= MAX_BUCKETS) {
-    pruneExpired(now);
-    if (buckets.size >= MAX_BUCKETS) return { ok: false, retryAfterSeconds: rule.windowSeconds };
+  /** Drop expired buckets across all partitions occasionally so the Maps cannot grow without bound. */
+  private maybePrune(now: number): void {
+    if (now - this.lastPrune < PRUNE_INTERVAL_MS) return;
+    for (const map of Object.values(this.partitions)) pruneExpired(map, now);
+    this.lastPrune = now;
   }
 
-  buckets.set(key, { count: 1, resetAt: now + rule.windowSeconds * 1000 });
-  return { ok: true };
+  reset(): void {
+    for (const map of Object.values(this.partitions)) map.clear();
+    this.lastPrune = 0;
+  }
+}
+
+const defaultStore = new InMemoryRateLimitStore();
+
+/**
+ * Count one hit against `key`. Synchronous because the default store is in-memory; swap in a shared
+ * store (returning a Promise) and `await` this to get a global cap — the signature is unchanged.
+ */
+export function checkRateLimit(key: string, rule: RateLimitRule, now: number = Date.now()): RateLimitResult {
+  return defaultStore.hit(key, rule, now) as RateLimitResult;
 }
 
 /**
@@ -67,13 +132,13 @@ export function checkRateLimit(key: string, rule: RateLimitRule, now: number = D
  * `x-real-ip` from the real connecting socket and overwrites any client-supplied copies, so those
  * are trustworthy. (`NextRequest.ip` was removed in this Next version, so we read headers.)
  *
- * We never trust the FIRST `x-forwarded-for` hop: a client can send any `X-Forwarded-For`, and a
- * proxy APPENDS the real IP after it, so the first token stays attacker-controlled — rotating it
- * would mint unlimited buckets and bypass every limit. If we must fall back to raw XFF we take the
- * LAST hop (the one our nearest proxy added).
+ * We do NOT trust `x-forwarded-for` at all: off-Vercel it is fully client-controlled (a client can
+ * send any value, and even the "last hop" is only trustworthy if a known proxy appended it), so
+ * reading it would let a caller mint a fresh bucket per request and bypass every per-IP limit.
  *
- * Order: x-vercel-forwarded-for, x-real-ip, last x-forwarded-for hop, "unknown". The "unknown"
- * fallback buckets all such callers together — safe (over-limits), never under-limits.
+ * Order: x-vercel-forwarded-for, x-real-ip, else "unknown". Off-Vercel (or when a trusted proxy
+ * does not set `x-real-ip`) every caller shares the single "unknown" IP bucket — safe (over-limits,
+ * never under-limits). Per-user limits are the real control for authenticated routes.
  */
 export function clientIp(request: { headers: { get(name: string): string | null } }): string {
   const vercel = request.headers.get("x-vercel-forwarded-for")?.trim();
@@ -82,12 +147,6 @@ export function clientIp(request: { headers: { get(name: string): string | null 
   const real = request.headers.get("x-real-ip")?.trim();
   if (real) return real;
 
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) {
-    const hops = forwarded.split(",");
-    const last = hops[hops.length - 1]?.trim();
-    if (last) return last;
-  }
   return "unknown";
 }
 
@@ -114,7 +173,11 @@ export const RATE_LIMITS = {
   demoMint: (): RateLimitRule => ruleFromEnv("RATE_LIMIT_DEMO_MINT", { limit: 10, windowSeconds: 600 }),
   /** Chat completions. Applied per session userId AND per IP. */
   chat: (): RateLimitRule => ruleFromEnv("RATE_LIMIT_CHAT", { limit: 30, windowSeconds: 60 }),
-  /** Voice transcription. */
+  /** Paid model-backed memory routes (ask, propose, entries POST, memory PUT). Per session userId. */
+  model: (): RateLimitRule => ruleFromEnv("RATE_LIMIT_MODEL", { limit: 20, windowSeconds: 60 }),
+  /** Same memory routes, per IP — a touch more lenient, since one IP can carry several legit users (NAT). */
+  modelIp: (): RateLimitRule => ruleFromEnv("RATE_LIMIT_MODEL_IP", { limit: 40, windowSeconds: 60 }),
+  /** Voice transcription. Applied per session userId AND per IP. */
   voice: (): RateLimitRule => ruleFromEnv("RATE_LIMIT_VOICE", { limit: 10, windowSeconds: 60 }),
 };
 
@@ -129,8 +192,27 @@ export function rateLimitResponse(retryAfterSeconds: number): Response {
   );
 }
 
+/**
+ * Enforce a per-IP then per-user limit for one route family, before any model/DB work. Returns a
+ * 429 `Response` to return as-is, or `null` to proceed. The two keys land in different partitions
+ * (`<family>:ip:<ip>` and `<family>:user:<userId>`), so the IP and user budgets are independent and
+ * an IP flood cannot evict a user's bucket.
+ */
+export function enforceIpAndUserLimit(
+  family: string,
+  userId: string,
+  request: { headers: { get(name: string): string | null } },
+  perIp: RateLimitRule,
+  perUser: RateLimitRule,
+): Response | null {
+  const ip = checkRateLimit(`${family}:ip:${clientIp(request)}`, perIp);
+  if (!ip.ok) return rateLimitResponse(ip.retryAfterSeconds);
+  const user = checkRateLimit(`${family}:user:${userId}`, perUser);
+  if (!user.ok) return rateLimitResponse(user.retryAfterSeconds);
+  return null;
+}
+
 /** Test-only: clear every bucket so one test's hits do not leak into the next. */
 export function __resetRateLimitsForTests(): void {
-  buckets.clear();
-  lastPrune = 0;
+  defaultStore.reset();
 }

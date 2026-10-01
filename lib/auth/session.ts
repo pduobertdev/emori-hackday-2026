@@ -13,11 +13,57 @@ export type Session = { tenantId: string; userId: string; role: Role; exp: numbe
 export const COOKIE_NAME = "emori_session";
 export const DEMO_SESSION_TTL_SECONDS = 12 * 60 * 60;
 const MIN_SECRET_LENGTH = 32;
+/**
+ * Minimum Shannon entropy per character. A good random secret (e.g. 32 bytes as hex) is ~4 bits/char;
+ * padded or repeated values ("aaaa…", "passwordpassword…") fall well below 3. This rejects the weak
+ * secrets a length check alone lets through, without false-positives on real random secrets.
+ */
+const MIN_SECRET_ENTROPY_BITS = 3;
 
+/** Only warn once per process about a bad secret, so a per-request check does not spam the log. */
+let warnedBadSecret = false;
+function warnBadSecret(reason: string): void {
+  if (warnedBadSecret) return;
+  warnedBadSecret = true;
+  // Never log the value itself — only why it was refused.
+  console.error(`EMORI_SESSION_SECRET ${reason}; refusing every authenticated request.`);
+}
+
+/** Shannon entropy in bits per character. 0 for a single repeated character. */
+function entropyBitsPerChar(value: string): number {
+  const counts = new Map<string, number>();
+  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
+  let bits = 0;
+  for (const count of counts.values()) {
+    const p = count / value.length;
+    bits -= p * Math.log2(p);
+  }
+  return bits;
+}
+
+/**
+ * The signing secret, or null when it is unset or too weak (length, padding, or low entropy). When
+ * null, every authenticated route fails closed. A weak secret is as dangerous as none — a forgeable
+ * MAC makes every token trustable — so we refuse it the same way.
+ */
 export function getSessionSecret(env: Record<string, string | undefined> = process.env): string | null {
-  const secret = env.EMORI_SESSION_SECRET?.trim();
-  if (!secret || secret.length < MIN_SECRET_LENGTH) return null;
-  return secret;
+  const raw = env.EMORI_SESSION_SECRET;
+  if (!raw) return null;
+  if (raw !== raw.trim()) {
+    warnBadSecret("has leading or trailing whitespace");
+    return null;
+  }
+  if (raw.length < MIN_SECRET_LENGTH) return null;
+  if (entropyBitsPerChar(raw) < MIN_SECRET_ENTROPY_BITS) {
+    warnBadSecret("is too low-entropy (repeated or too few distinct characters)");
+    return null;
+  }
+  return raw;
+}
+
+/** True only when the deployment opted the public demo in. Defaults to off. */
+function demoAccessEnabled(): boolean {
+  return process.env.EMORI_DEMO_ACCESS?.trim().toLowerCase() === "on";
 }
 
 export function createSession(
@@ -93,11 +139,14 @@ export function verifySession(
   return parsed;
 }
 
-export function sessionTokenFromRequest(request: Request): string | undefined {
+/** A token plus whether it arrived as a Bearer header (vs a cookie). Bearer callers are CSRF-exempt. */
+type TokenSource = { token: string; viaBearer: boolean };
+
+function readToken(request: Request): TokenSource | undefined {
   const authorization = request.headers.get("authorization");
   if (authorization?.startsWith("Bearer ")) {
     const token = authorization.slice("Bearer ".length).trim();
-    if (token) return token;
+    if (token) return { token, viaBearer: true };
   }
 
   const cookie = request.headers.get("cookie");
@@ -106,29 +155,100 @@ export function sessionTokenFromRequest(request: Request): string | undefined {
     const index = part.indexOf("=");
     if (index === -1) continue;
     if (part.slice(0, index).trim() === COOKIE_NAME) {
-      return decodeURIComponent(part.slice(index + 1).trim());
+      const raw = part.slice(index + 1).trim();
+      try {
+        return { token: decodeURIComponent(raw), viaBearer: false };
+      } catch {
+        // Malformed %-encoding — treat as no session (401) rather than letting decodeURIComponent throw.
+        return undefined;
+      }
     }
   }
   return undefined;
+}
+
+export function sessionTokenFromRequest(request: Request): string | undefined {
+  return readToken(request)?.token;
 }
 
 function unauthorized(): Response {
   return Response.json({ error: "Sign in required." }, { status: 401, headers: { "Cache-Control": "no-store" } });
 }
 
+function forbidden(): Response {
+  return Response.json({ error: "Cross-site request blocked." }, { status: 403, headers: { "Cache-Control": "no-store" } });
+}
+
+const STATE_CHANGING_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
+
+/** Hosts that count as "this app": the request URL host plus any proxy-set Host / X-Forwarded-Host. */
+function allowedHosts(request: Request): Set<string> {
+  const hosts = new Set<string>();
+  const add = (value: string | null | undefined) => {
+    if (value) hosts.add(value.trim().toLowerCase());
+  };
+  add(request.headers.get("host"));
+  for (const part of request.headers.get("x-forwarded-host")?.split(",") ?? []) add(part);
+  try {
+    add(new URL(request.url).host);
+  } catch {
+    /* non-absolute URL — ignore */
+  }
+  return hosts;
+}
+
 /**
- * Resolve the caller's session or a 401 Response. Call this FIRST in every protected route,
+ * CSRF defense for cookie-authenticated writes. A browser attaches the session cookie automatically
+ * on a cross-site form/fetch POST, so we check the request is same-origin:
+ *  - Origin present → its host must be one of this app's hosts, else reject.
+ *  - Origin absent → fall back to Sec-Fetch-Site (reject only an explicit "cross-site").
+ *  - Neither header → allow (a non-browser client that sends no Origin).
+ */
+function sameOriginOk(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  if (origin) {
+    let originHost: string;
+    try {
+      originHost = new URL(origin).host.toLowerCase();
+    } catch {
+      return false;
+    }
+    return allowedHosts(request).has(originHost);
+  }
+
+  const secFetchSite = request.headers.get("sec-fetch-site");
+  if (secFetchSite) return secFetchSite !== "cross-site";
+
+  return true;
+}
+
+/**
+ * Resolve the caller's session, or a Response (401/403). Call this FIRST in every protected route,
  * before any config/provider check, so an unauthenticated caller can never learn whether a
  * database or model is configured.
+ *
+ * Also: a demo-role token is rejected unless EMORI_DEMO_ACCESS is on (so turning the demo off is a
+ * real kill switch for tokens already issued), and cookie-authenticated state-changing requests must
+ * be same-origin (CSRF). Bearer callers are exempt from the origin check.
  */
 export function requireSession(request: Request): Session | Response {
   const secret = getSessionSecret();
   if (!secret) {
-    console.error("EMORI_SESSION_SECRET is not set; refusing every authenticated request.");
+    warnBadSecret("is not set");
     return unauthorized();
   }
-  const session = verifySession(sessionTokenFromRequest(request), { secret });
-  return session ?? unauthorized();
+
+  const source = readToken(request);
+  const session = verifySession(source?.token, { secret });
+  if (!session) return unauthorized();
+
+  if (session.role === "demo" && !demoAccessEnabled()) return unauthorized();
+
+  if (!source?.viaBearer && STATE_CHANGING_METHODS.has(request.method) && !sameOriginOk(request)) {
+    return forbidden();
+  }
+
+  return session;
 }
 
 export function buildSessionCookie(
