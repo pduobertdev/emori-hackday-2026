@@ -8,6 +8,7 @@ import {
   isSensitivePath,
   scrubBreadcrumb,
   scrubEvent,
+  scrubStreamedSpan,
   scrubString,
   scrubUrl,
 } from "../lib/sentry/scrub";
@@ -193,4 +194,82 @@ test("options: disabled without DSN, privacy-first, low trace rate", () => {
   assert.equal(tracesSampleRate("0.2"), 0.2);
   assert.equal(tracesSampleRate("abc"), 0.05);
   assert.equal(tracesSampleRate("5"), 0.05);
+});
+
+test("B2: request paths/URLs in contexts go through scrubUrl (raw query)", () => {
+  const event = scrubEvent({
+    contexts: {
+      nextjs: { request_path: "/api/qa-boom?email=bob%40ex.com&page=2&code=OAUTHCODE", route_type: "route" },
+      other: { url: "https://x.io/cb?state=S1&code=C1&q=ok", href: "/p?token=t1" },
+    },
+  } as unknown as Event);
+  const ctx = event.contexts as Record<string, Record<string, string>>;
+  assert.equal(ctx.nextjs.request_path, `/api/qa-boom?email=${FILTERED}&page=2&code=${FILTERED}`);
+  assert.equal(ctx.nextjs.route_type, "route");
+  assert.equal(ctx.other.url, `https://x.io/cb?state=${FILTERED}&code=${FILTERED}&q=ok`);
+  assert.equal(ctx.other.href, `/p?token=${FILTERED}`);
+});
+
+test("B2: scrubString/scrubUrl percent-decode first (encoded emails, malformed input safe)", () => {
+  assert.equal(scrubString("user bob%40ex.com failed"), `user ${EMAIL_PLACEHOLDER} failed`);
+  // Double-encoded (%2540) is decoded too.
+  assert.equal(scrubString("double bob%2540ex.com"), `double ${EMAIL_PLACEHOLDER}`);
+  assert.equal(scrubUrl("/x?u=bob%40ex.com&n=1"), `/x?u=${EMAIL_PLACEHOLDER}&n=1`);
+  // Malformed encodings never throw; valid runs next to them still decode.
+  assert.doesNotThrow(() => scrubString("bad %E0%A4%A and %ZZ and %"));
+  assert.equal(scrubString("bad %E0%A4%A then bob%40ex.com"), `bad %E0%A4%A then ${EMAIL_PLACEHOLDER}`);
+  assert.equal(scrubUrl("/x?%E0%A4%A=1&email=bob%40ex.com"), `/x?%E0%A4%A=1&email=${FILTERED}`);
+});
+
+test("B2: code=/state=/token=/email= are filtered in raw query strings inside free text", () => {
+  assert.equal(
+    scrubString("GET /cb?code=OAUTHCODE&state=S&page=2&token=T&email=bob%40ex.com"),
+    `GET /cb?code=${FILTERED}&state=${FILTERED}&page=2&token=${FILTERED}&email=${FILTERED}`,
+  );
+  // Non-query "code" in prose stays readable.
+  assert.equal(scrubString("error code: ECONNREFUSED"), "error code: ECONNREFUSED");
+});
+
+test("ElevenLabs sk_ and OpenRouter sk-or-v1- keys are redacted", () => {
+  assert.equal(scrubString("key sk_0123456789abcdef0123456789abcdef end"), `key ${FILTERED} end`);
+  assert.equal(scrubString("or sk-or-v1-0123456789abcdefABCDEF end"), `or ${FILTERED} end`);
+  // Short sk_ identifiers (not keys) are left alone.
+  assert.equal(scrubString("sk_short"), "sk_short");
+});
+
+test("B1: scrubStreamedSpan scrubs name, string attributes, typed attributes and arrays", () => {
+  const span = scrubStreamedSpan({
+    trace_id: "t",
+    span_id: "s",
+    name: "GET /?email=bob@ex.com&code=OAUTHCODE",
+    start_timestamp: 1,
+    status: "error",
+    is_segment: true,
+    attributes: {
+      "http.target": "/?email=bob@ex.com&code=OAUTHCODE&page=2",
+      "url.query": "?token=abc&code=C&page=2",
+      "sentry.status.message": "Boom jane@x.io Bearer sk-or-v1-ABCDEFGHIJKLMNOPQRST password=hunter2",
+      "http.request.header.cookie": ["a=b"],
+      "typed.message": { value: "mail jane@x.io", type: "string" },
+      "http.status_code": 500,
+      "http.route": "/api/qa-boom",
+    },
+    links: [{ context: { traceId: "t", spanId: "s" }, attributes: { "url.full": "https://x.io/?email=a@b.co" } }],
+  } as unknown as Parameters<typeof scrubStreamedSpan>[0]);
+  assert.equal(span.name, `GET /?email=${FILTERED}&code=${FILTERED}`);
+  const a = span.attributes as Record<string, unknown>;
+  assert.equal(a["http.target"], `/?email=${FILTERED}&code=${FILTERED}&page=2`);
+  assert.equal(a["url.query"], `token=${FILTERED}&code=${FILTERED}&page=2`);
+  assert.equal(a["sentry.status.message"], `Boom ${EMAIL_PLACEHOLDER} Bearer ${FILTERED} password=${FILTERED}`);
+  assert.deepEqual(a["http.request.header.cookie"], [FILTERED]);
+  assert.deepEqual(a["typed.message"], { value: `mail ${EMAIL_PLACEHOLDER}`, type: "string" });
+  assert.equal(a["http.status_code"], 500);
+  assert.equal(a["http.route"], "/api/qa-boom");
+  assert.equal((span.links?.[0].attributes as Record<string, unknown>)["url.full"], `https://x.io/?email=${FILTERED}`);
+});
+
+test("options: streaming kept with beforeSendSpan wired", () => {
+  const o = sentryOptions("x", undefined);
+  assert.equal(o.traceLifecycle, "stream");
+  assert.equal(typeof o.beforeSendSpan, "function");
 });

@@ -1,6 +1,13 @@
 // Shared Sentry.init options for client, server and edge. Privacy first, quota friendly.
 import type { BrowserOptions, NodeOptions } from "@sentry/nextjs";
-import { scrubBreadcrumb, scrubEvent } from "./scrub";
+import { scrubBreadcrumb, scrubDsc, scrubEvent, scrubStreamedSpan } from "./scrub";
+
+type HookableClient = { on(hook: "createDsc", callback: (dsc: Record<string, unknown>) => void): unknown };
+
+/** Call right after Sentry.init: scrubs the DSC (envelope `trace` header / baggage), which no before* hook covers. */
+export function installPrivacyHooks(client: HookableClient | undefined): void {
+  client?.on("createDsc", scrubDsc);
+}
 
 /** 5% of requests traced by default; override with SENTRY_TRACES_SAMPLE_RATE / NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE. */
 export function tracesSampleRate(raw: string | undefined): number {
@@ -56,8 +63,12 @@ export function sentryOptions(dsn: string | undefined, rawRate: string | undefin
       queues: false,
       stackFrameVariables: false,
     },
+    // v11 streams spans by default (`traceLifecycle: 'stream'`), which IGNORES beforeSendTransaction.
+    // We keep streaming (the SDK's default and future path; beforeSendTransaction is removed in v12)
+    // and scrub every span with beforeSendSpan instead. Pinned explicitly so the hook always matches.
+    traceLifecycle: "stream",
     beforeSend: (event) => scrubEvent(event),
-    beforeSendTransaction: (event) => scrubEvent(event),
+    beforeSendSpan: (span) => scrubStreamedSpan(span),
     beforeBreadcrumb: (breadcrumb) => scrubBreadcrumb(breadcrumb),
   } satisfies BrowserOptions & NodeOptions;
 }
