@@ -40,6 +40,9 @@ function applyConfigEnv() {
   process.env.EMORI_SESSION_SECRET = SECRET;
   // Demo tokens are used throughout these tests; requireSession now gates them on this flag.
   process.env.EMORI_DEMO_ACCESS = "on";
+  // clientIp trusts x-real-ip / x-vercel-forwarded-for only on Vercel, so the per-IP tests below
+  // need this set to exercise distinct IP buckets (off-Vercel every IP collapses to "unknown").
+  process.env.VERCEL = "1";
   for (const [key, value] of Object.entries(CONFIG_ENV)) process.env[key] = value;
   process.env.AI_BASE_URL = model.baseURL;
   delete process.env.CRUSOE_API_KEY;
@@ -48,6 +51,7 @@ function applyConfigEnv() {
 function clearConfigEnv() {
   for (const key of Object.keys(CONFIG_ENV)) delete process.env[key];
   delete process.env.AI_BASE_URL;
+  delete process.env.VERCEL;
 }
 
 function token(input: { tenantId: string; userId: string; role: Role; ttlSeconds?: number }): string {
@@ -516,4 +520,41 @@ test("POST /api/memory/image enforces a per-USER limit, even from rotating IPs (
   const second = await imagePost(img("2.2.2.2")); // same user, fresh IP
   assert.equal(second.status, 429, "the per-user limit blocks even from a new IP");
   assert.ok(Number(second.headers.get("Retry-After")) > 0, "a Retry-After is set");
+});
+
+test("the per-user model budget is ONE shared limit across ask/propose/entries/PUT/image", async () => {
+  // All five paid model routes key their per-user limit under the same "model" family, so a single
+  // 20/min budget is shared across them — spending it on ask + propose exhausts it for entries/image.
+  process.env.RATE_LIMIT_MODEL = "20:60"; // shared per-user budget = 20
+  process.env.RATE_LIMIT_MODEL_IP = "1000:60"; // per-IP generous, so the per-user limit is what fires
+  __resetRateLimitsForTests();
+  freshBackend();
+
+  const ip = "3.3.3.3";
+  const tok = token({ tenantId: "demo", userId: "shared-budget-user", role: "demo" });
+
+  // 10 ask + 10 propose from the one user = 20 hits, exactly the shared budget.
+  for (let i = 0; i < 10; i++) {
+    const r = await askPost(ipReq("POST", { question: "what is stored here?" }, tok, ip));
+    assert.notEqual(r.status, 429, `ask #${i + 1} is within budget`);
+    await drain(r);
+  }
+  for (let i = 0; i < 10; i++) {
+    const r = await proposePost(ipReq("POST", { messages: [{ role: "user", content: "i like tea" }] }, tok, ip));
+    assert.notEqual(r.status, 429, `propose #${i + 1} is within budget`);
+    await drain(r);
+  }
+
+  // The 21st call — on a DIFFERENT route (entries) — is rejected: the budget is shared, not per-route.
+  const entries = await entriesPost(ipReq("POST", { text: "one too many" }, tok, ip));
+  assert.equal(entries.status, 429, "entries is blocked by the shared per-user model budget");
+  // ...and image too, for the same reason.
+  const image = await imagePost(ipReq("POST", { not: "multipart" }, tok, ip));
+  assert.equal(image.status, 429, "image is blocked by the same shared budget");
+
+  // Positive control: a different user has their own fresh 20/min budget.
+  const other = token({ tenantId: "demo", userId: "other-user", role: "demo" });
+  const otherAsk = await askPost(ipReq("POST", { question: "anything?" }, other, ip));
+  assert.notEqual(otherAsk.status, 429, "a different user is not affected by the first user's budget");
+  await drain(otherAsk);
 });

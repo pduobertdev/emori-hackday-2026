@@ -70,9 +70,12 @@ header (no model/DB cost on a rejected request):
   independent budgets, not a single shared cap. The mint returns the session **only** as the
   HttpOnly cookie — never in the JSON body, so a token can't be scraped and replayed.
 - `POST /api/chat` is limited per IP **and** per session `userId` (default **30 per min** each).
-- The paid memory routes — `POST /api/memory/ask`, `POST /api/memory/propose`,
-  `POST /api/memory/entries` and `PUT /api/memory` — are each limited per session `userId` (default
-  **20 per min**) **and** per IP (default **40 per min**).
+- The five paid memory routes — `POST /api/memory/ask`, `POST /api/memory/propose`,
+  `POST /api/memory/entries`, `PUT /api/memory` and `POST /api/memory/image` — share **one**
+  rate-limit budget keyed under the same `model` family: a single **20 per min per session `userId`**
+  **and** a single **40 per min per IP**, counted *across all five routes combined* (not 20/min each).
+  So, for example, 10 `ask` calls plus 10 `propose` calls exhaust the per-user budget, and the next
+  `entries` or `image` call from that user returns `429`.
 - `POST /api/voice/transcribe` is limited per session `userId` **and** per IP (default **10 per min**).
 
 Each limit is overridable with an env var in `limit:windowSeconds` form — `RATE_LIMIT_DEMO_MINT`,
@@ -93,13 +96,16 @@ it can never evict or lock out a per-user bucket, so the per-user limit is the r
 authenticated route. (Evicting an IP bucket resets that IP's counter — acceptable, because the
 per-user limit still holds.)
 
-**IP trust assumption.** The per-IP key is derived **only** from `x-vercel-forwarded-for` then
-`x-real-ip` (which Vercel sets from the real connection and the client cannot forge). `x-forwarded-for`
-is **ignored entirely** — off-Vercel it is fully client-controlled, so trusting any of its hops would
-let a caller mint a fresh bucket per request. If neither trusted header is present (off-Vercel, or
-behind a proxy that doesn't set `x-real-ip`), all requests share one `"unknown"` IP bucket — safe,
-since it only ever over-limits, and the per-user limit is the real control. **Deploy behind Vercel**
-(or a proxy that sets `x-real-ip`) for meaningful per-IP limits. The IP value is also sanitized before
+**IP trust assumption.** The forwarding headers are trusted **only when the app runs on Vercel**
+(`process.env.VERCEL === "1"`). There, the per-IP key is derived **only** from
+`x-vercel-forwarded-for` then `x-real-ip` (which Vercel sets from the real connection and the client
+cannot forge). `x-forwarded-for` is **ignored entirely** — it is fully client-controlled, so trusting
+any of its hops would let a caller mint a fresh bucket per request. **Anywhere other than Vercel**
+(local dev, another host, or `VERCEL` unset/`"0"`), **no** forwarding header is trusted — Next route
+handlers don't expose the socket address, so there is no trustworthy client IP — and **every request
+shares one `"unknown"` IP bucket**, exactly like the invalid-IP case: safe, since it only ever
+over-limits, and the per-user limit is the real control. **Deploy behind Vercel** for meaningful
+per-IP limits. When a header is trusted, the IP value is also sanitized before
 it becomes part of a key: it is validated with `node:net` (anything that isn't a real IPv4/IPv6 literal
 collapses to a single shared `"invalid"` bucket), IPv4 passes through unchanged, and **IPv6 is bucketed
 by its /64 prefix** (an ISP hands one customer a whole /64, so keying on the full address would let a

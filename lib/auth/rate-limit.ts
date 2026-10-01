@@ -138,24 +138,27 @@ export function checkRateLimit(
 /**
  * The caller's IP, used only as a rate-limit bucket key.
  *
- * TRUST ASSUMPTION: this app is deployed behind Vercel. Vercel sets `x-vercel-forwarded-for` and
- * `x-real-ip` from the real connecting socket and overwrites any client-supplied copies, so those
- * are trustworthy. (`NextRequest.ip` was removed in this Next version, so we read headers.)
+ * TRUST ASSUMPTION: this app is deployed behind Vercel. ONLY on Vercel are `x-vercel-forwarded-for`
+ * and `x-real-ip` platform-set from the real connecting socket (overwriting any client-supplied
+ * copies), so we trust those headers ONLY when `process.env.VERCEL === "1"`. The env is read at call
+ * time, not module load, so tests can toggle it.
  *
- * We do NOT trust `x-forwarded-for` at all: off-Vercel it is fully client-controlled (a client can
- * send any value, and even the "last hop" is only trustworthy if a known proxy appended it), so
- * reading it would let a caller mint a fresh bucket per request and bypass every per-IP limit.
+ * Off-Vercel we trust NO forwarding header: Next route handlers don't expose the socket address, and
+ * every `x-*-for` header is client-controllable, so reading one would let a caller mint a fresh
+ * bucket per request and bypass every per-IP limit. We therefore return the single shared "unknown"
+ * bucket — consistent with the invalid-IP handling: safe (over-limits, never under-limits). Per-user
+ * limits are the real control for authenticated routes.
  *
- * Order: x-vercel-forwarded-for, x-real-ip, else "unknown". Off-Vercel (or when a trusted proxy
- * does not set `x-real-ip`) every caller shares the single "unknown" IP bucket — safe (over-limits,
- * never under-limits). Per-user limits are the real control for authenticated routes.
+ * Order on Vercel: x-vercel-forwarded-for, x-real-ip, else "unknown".
  */
 export function clientIp(request: { headers: { get(name: string): string | null } }): string {
-  const vercel = request.headers.get("x-vercel-forwarded-for")?.trim();
-  if (vercel) return sanitizeIp(vercel);
+  if (process.env.VERCEL === "1") {
+    const vercel = request.headers.get("x-vercel-forwarded-for")?.trim();
+    if (vercel) return sanitizeIp(vercel);
 
-  const real = request.headers.get("x-real-ip")?.trim();
-  if (real) return sanitizeIp(real);
+    const real = request.headers.get("x-real-ip")?.trim();
+    if (real) return sanitizeIp(real);
+  }
 
   return "unknown";
 }

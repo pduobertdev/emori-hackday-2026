@@ -42,23 +42,23 @@ function entropyBitsPerChar(value: string): number {
 }
 
 /**
- * The signing secret, or null when it is unset or too weak (length, padding, or low entropy). When
- * null, every authenticated route fails closed. A weak secret is as dangerous as none — a forgeable
- * MAC makes every token trustable — so we refuse it the same way.
+ * The signing secret, or null when it is unset or too weak (length or low entropy). Surrounding
+ * whitespace (e.g. a trailing newline from `echo … > .env`, or leading spaces) is trimmed first, and
+ * the trimmed value is what we sign and verify with everywhere — so a secret pasted with a stray
+ * newline still works. The strength check applies to the trimmed value. When null, every
+ * authenticated route fails closed. A weak secret is as dangerous as none — a forgeable MAC makes
+ * every token trustable — so we refuse it the same way.
  */
 export function getSessionSecret(env: Record<string, string | undefined> = process.env): string | null {
   const raw = env.EMORI_SESSION_SECRET;
   if (!raw) return null;
-  if (raw !== raw.trim()) {
-    warnBadSecret("has leading or trailing whitespace");
-    return null;
-  }
-  if (raw.length < MIN_SECRET_LENGTH) return null;
-  if (entropyBitsPerChar(raw) < MIN_SECRET_ENTROPY_BITS) {
+  const secret = raw.trim();
+  if (secret.length < MIN_SECRET_LENGTH) return null;
+  if (entropyBitsPerChar(secret) < MIN_SECRET_ENTROPY_BITS) {
     warnBadSecret("is too low-entropy (repeated or too few distinct characters)");
     return null;
   }
-  return raw;
+  return secret;
 }
 
 /** True only when the deployment opted the public demo in. Defaults to off. */

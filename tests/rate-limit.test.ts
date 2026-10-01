@@ -12,6 +12,7 @@ import {
 afterEach(() => {
   __resetRateLimitsForTests();
   delete process.env.RATE_LIMIT_CHAT;
+  delete process.env.VERCEL;
 });
 
 test("allows up to the limit, then blocks with a positive Retry-After", () => {
@@ -44,7 +45,22 @@ test("keys are independent", () => {
   assert.equal(checkRateLimit("a", rule, "ip", now).ok, false);
 });
 
+test("on Vercel, clientIp honors platform headers only; off Vercel everything is 'unknown'", () => {
+  const h = (headers: Record<string, string>) => ({ headers: new Headers(headers) });
+
+  // Off Vercel: no forwarding header is trusted, so every caller shares the one "unknown" bucket.
+  delete process.env.VERCEL;
+  assert.equal(clientIp(h({ "x-vercel-forwarded-for": "11.11.11.11" })), "unknown");
+  assert.equal(clientIp(h({ "x-real-ip": "9.9.9.9" })), "unknown");
+  assert.equal(clientIp(h({ "x-forwarded-for": "6.6.6.6" })), "unknown");
+
+  // A spoofed header cannot create a distinct bucket off-Vercel.
+  process.env.VERCEL = "0";
+  assert.equal(clientIp(h({ "x-real-ip": "9.9.9.9" })), "unknown");
+});
+
 test("clientIp uses only platform headers; x-forwarded-for is ignored entirely", () => {
+  process.env.VERCEL = "1";
   const h = (headers: Record<string, string>) => ({ headers: new Headers(headers) });
   assert.equal(clientIp(h({ "x-vercel-forwarded-for": "11.11.11.11" })), "11.11.11.11");
   assert.equal(clientIp(h({ "x-real-ip": "9.9.9.9" })), "9.9.9.9");
@@ -69,6 +85,7 @@ test("a spoofed x-forwarded-for cannot mint a fresh rate-limit bucket", () => {
 });
 
 test("clientIp sanitizes implausible headers to 'invalid' and buckets IPv6 by its /64 prefix", () => {
+  process.env.VERCEL = "1";
   const h = (v: string) => ({ headers: new Headers({ "x-real-ip": v }) });
   assert.equal(clientIp(h("foo:user:bar")), "invalid", "a value with non-hex chars is rejected, colon or not");
   assert.equal(clientIp(h("1.2.3.4 5.6.7.8")), "invalid", "whitespace is rejected");
@@ -101,6 +118,7 @@ test("clientIp sanitizes implausible headers to 'invalid' and buckets IPv6 by it
 });
 
 test("an attacker rotating addresses within one /64 cannot escape the per-IP limit", () => {
+  process.env.VERCEL = "1";
   const rule = { limit: 1, windowSeconds: 60 };
   const now = 9_000_000;
   const ip = (suffix: string) => clientIp({ headers: new Headers({ "x-real-ip": `2001:db8::${suffix}` }) });
@@ -113,6 +131,7 @@ test("an attacker rotating addresses within one /64 cannot escape the per-IP lim
 });
 
 test("M1: a spoofed x-real-ip containing ':user:' cannot reach or evict the per-user partition", () => {
+  process.env.VERCEL = "1";
   const store = new InMemoryRateLimitStore(1); // one bucket per partition — easy to force eviction
   const rule = { limit: 1, windowSeconds: 60 };
   const now = 8_000_000;

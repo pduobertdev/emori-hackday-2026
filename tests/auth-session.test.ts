@@ -30,14 +30,29 @@ test("getSessionSecret requires at least 32 characters", () => {
   assert.equal(getSessionSecret({}), null);
 });
 
-test("getSessionSecret rejects low-entropy and padded secrets", () => {
+test("getSessionSecret rejects low-entropy secrets", () => {
   // Long enough but trivially weak — one repeated character.
   assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: "x".repeat(32) }), null);
   assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: "ab".repeat(16) }), null);
-  // Padded whitespace does not count toward strength: raw must equal trimmed.
-  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: `  ${SECRET}  ` }), null);
   // A real random-looking secret is accepted.
   assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: SECRET }), SECRET);
+});
+
+test("getSessionSecret trims surrounding whitespace and uses the trimmed value", () => {
+  // Trailing newline, CRLF, and leading spaces are all tolerated — the trimmed secret is returned.
+  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: `${SECRET}\n` }), SECRET);
+  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: `${SECRET}\r\n` }), SECRET);
+  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: `  ${SECRET}` }), SECRET);
+  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: `  ${SECRET}  ` }), SECRET);
+  // The strength check still applies to the TRIMMED value: 31 chars + a newline is too short.
+  assert.equal(getSessionSecret({ EMORI_SESSION_SECRET: `${"0a1b2c3d4e5f60718293a4b5c6d7e8f"}\n` }), null);
+});
+
+test("a token signed with a padded secret verifies against the trimmed secret", () => {
+  const padded = `  ${SECRET}\n`;
+  const token = signSession(createSession({ tenantId: "acme", userId: "alice", role: "member", ttlSeconds: 3600 }), getSessionSecret({ EMORI_SESSION_SECRET: padded }));
+  // Verifying with the trimmed value (what getSessionSecret returns everywhere) succeeds.
+  assert.ok(verifySession(token, { secret: SECRET }));
 });
 
 test("a signed session round-trips through verify", () => {
